@@ -5,6 +5,8 @@
   Masterからのコマンドを受信し、音声を再生する。
   rednet (Wireless Modem) で通信。
   
+  ストレージ不要: HTTPから直接ストリーミング再生
+  
   使い方:
     1. Wireless ModemをComputerに取り付ける
     2. SpeakerをComputerに接続する
@@ -21,10 +23,8 @@
 local API_BASE_URL = "https://ipod-2to6magyna-uc.a.run.app/"
 local VERSION = "2.1"
 local PROTOCOL = "park_music_v3"
-local CACHE_DIR = "cache"
 local CONFIG_FILE = ".slave_config"
 local HELLO_INTERVAL = 3
-local HEARTBEAT_INTERVAL = 5
 local DL_TIMEOUT = 30
 local MASTER_TIMEOUT = 30
 
@@ -81,9 +81,6 @@ if not group_name or not computer_name then
     end
 end
 
--- Cache dir
-if not fs.exists(CACHE_DIR) then fs.makeDir(CACHE_DIR) end
-
 -- Speakers
 local speakers = { peripheral.find("speaker") }
 if #speakers == 0 then
@@ -104,7 +101,10 @@ local state = {
     lastHello = 0,
 }
 
-local play_queue = {}
+-- Stream handle for current download
+local stream_handle = nil
+local stream_ready = false
+local stream_track = nil
 
 -- Log
 local log_lines = {}
@@ -212,17 +212,6 @@ local function uiUpdate()
 end
 
 ------------------------------------------------------------
--- Cache
-------------------------------------------------------------
-local function cachePath(track_id)
-    return CACHE_DIR .. "/" .. track_id .. ".dfpwm"
-end
-
-local function isCached(track_id)
-    return fs.exists(cachePath(track_id))
-end
-
-------------------------------------------------------------
 -- Rednet
 ------------------------------------------------------------
 local function openRednet()
@@ -249,127 +238,97 @@ local function broadcastToMaster(msg)
 end
 
 ------------------------------------------------------------
--- Download
+-- Stream download (no disk cache)
 ------------------------------------------------------------
-local function downloadTrack(track)
+local function startStream(track)
     local track_id = track.id
-    if isCached(track_id) then return true end
+
+    -- Close previous handle if any
+    if stream_handle then
+        pcall(function() stream_handle.close() end)
+        stream_handle = nil
+    end
 
     logMsg("DL: " .. (track.name or track_id))
     state.status = "DOWNLOADING"
+    state.track = track
     uiUpdate()
 
-    -- Delete old cache files to free space (Normal Computer only has ~125KB)
-    if fs.exists(CACHE_DIR) then
-        local files = fs.list(CACHE_DIR)
-        for _, f in ipairs(files) do
-            pcall(fs.delete, CACHE_DIR .. "/" .. f)
-        end
-    end
-
     local url = API_BASE_URL .. "?v=" .. VERSION .. "&id=" .. textutils.urlEncode(track_id)
-    local ok, data = pcall(function()
-        http.request({url = url, binary = true})
-        local timer = os.startTimer(DL_TIMEOUT)
-        while true do
-            local ev, p1, p2 = os.pullEvent()
-            if ev == "http_success" and p1 == url then
-                local d = p2.readAll()
-                p2.close()
-                os.cancelTimer(timer)
-                return d
-            elseif ev == "http_failure" and p1 == url then
-                os.cancelTimer(timer)
-                return nil
-            elseif ev == "timer" and p1 == timer then
-                return nil
-            end
-        end
-    end)
+    http.request({url = url, binary = true})
 
-    if ok and data and #data > 0 then
-        -- Check available space
-        local free = fs.getFreeSpace(CACHE_DIR)
-        if free < #data + 1024 then
-            logMsg("No space: need " .. #data .. "B, free " .. free .. "B")
+    local timer = os.startTimer(DL_TIMEOUT)
+    while true do
+        local ev, p1, p2 = os.pullEvent()
+        if ev == "http_success" and p1 == url then
+            stream_handle = p2
+            stream_ready = true
+            stream_track = track
+            os.cancelTimer(timer)
+            logMsg("Stream ready: " .. (track.name or track_id))
+            sendToMaster({type = "ready", track_id = track_id})
+            return true
+        elseif ev == "http_failure" and p1 == url then
+            os.cancelTimer(timer)
+            logMsg("DL fail: " .. (track.name or track_id))
+            state.status = "ERROR"
+            uiUpdate()
+            return false
+        elseif ev == "timer" and p1 == timer then
+            logMsg("DL timeout")
             state.status = "ERROR"
             uiUpdate()
             return false
         end
-        local wf = fs.open(cachePath(track_id), "wb")
-        if wf then
-            local w_ok, w_err = pcall(wf.write, wf, data)
-            wf.close()
-            if not w_ok then
-                logMsg("Write error: " .. tostring(w_err))
-                pcall(fs.delete, cachePath(track_id))
-                state.status = "ERROR"
-                uiUpdate()
-                return false
-            end
-        else
-            logMsg("Cannot open file for write")
-            state.status = "ERROR"
-            uiUpdate()
-            return false
-        end
-        logMsg("OK: " .. #data .. " bytes")
-        state.status = "READY"
-        uiUpdate()
-        return true
-    else
-        logMsg("FAIL: " .. (track.name or track_id))
-        state.status = "ERROR"
-        uiUpdate()
-        return false
     end
 end
 
 ------------------------------------------------------------
--- Audio playback
+-- Stream play (reads from HTTP handle, no disk)
 ------------------------------------------------------------
-local function playAudio(track)
-    local track_id = track.id
-    local path = cachePath(track_id)
-    if not fs.exists(path) then
-        logMsg("Cache miss: " .. track_id)
+local function playStream(track, start_time)
+    if not stream_handle then
+        logMsg("No stream: " .. (track.id or ""))
         sendToMaster({type = "track_end"})
         return
     end
 
-    logMsg("Playing: " .. (track.name or track_id))
+    -- Wait for start_time
+    if start_time then
+        state.status = "WAITING"
+        uiUpdate()
+        while not state.playback_stop and os.clock() < start_time do
+            sleep(0.05)
+        end
+    end
+
+    if state.playback_stop then
+        pcall(function() stream_handle.close() end)
+        stream_handle = nil
+        return
+    end
+
+    logMsg("Playing: " .. (track.name or track.id))
     state.status = "PLAYING"
-    state.track = track
     state.playback_stop = false
     uiUpdate()
     sendToMaster({type = "play_started", track = track})
 
     local decoder = require("cc.audio.dfpwm").make_decoder()
-    local f = fs.open(path, "rb")
-    if not f then
-        logMsg("Cannot open cache")
-        state.status = "READY"
-        state.track = nil
-        uiUpdate()
-        sendToMaster({type = "track_end"})
-        return
-    end
+    local chunk_size = 16 * 1024
 
     local ok, err = pcall(function()
-        local chunk_size = 16 * 1024
         while not state.playback_stop do
-            local chunk = f.read(chunk_size)
+            local chunk = stream_handle.read(chunk_size)
             if not chunk then break end
 
             local decoded = decoder(chunk)
             if decoded then
-                -- Play through all speakers
                 for _, sp in ipairs(speakers) do
                     pcall(sp.playAudio, decoded, state.volume)
                 end
                 -- Wait for speakers to finish
-                while true do
-                    if state.playback_stop then break end
+                while not state.playback_stop do
                     local any_busy = false
                     for _, sp in ipairs(speakers) do
                         local s_ok, level = pcall(sp.getAudioLevel)
@@ -385,7 +344,10 @@ local function playAudio(track)
         end
     end)
 
-    f.close()
+    pcall(function() stream_handle.close() end)
+    stream_handle = nil
+    stream_ready = false
+
     for _, sp in ipairs(speakers) do
         pcall(sp.stop)
     end
@@ -404,13 +366,16 @@ local function playAudio(track)
 end
 
 ------------------------------------------------------------
--- Audio loop (processes play_queue)
+-- Audio loop
 ------------------------------------------------------------
+local pending_play = nil
+
 local function audioLoop()
     while true do
-        if #play_queue > 0 then
-            local task = table.remove(play_queue, 1)
-            playAudio(task.track)
+        if pending_play then
+            local task = pending_play
+            pending_play = nil
+            playStream(task.track, task.start_time)
         else
             sleep(0.1)
         end
@@ -437,12 +402,7 @@ local function rednetLoop()
 
                 elseif cmd.cmd == "download" and cmd.track then
                     state.masterId = sender_id
-                    local dl_ok = downloadTrack(cmd.track)
-                    if dl_ok then
-                        sendToMaster({type = "ready", track_id = cmd.track.id})
-                    else
-                        sendToMaster({type = "track_end"})
-                    end
+                    startStream(cmd.track)
 
                 elseif cmd.cmd == "ping" then
                     state.masterId = sender_id
@@ -451,12 +411,16 @@ local function rednetLoop()
                 elseif cmd.cmd == "play_at" and cmd.track then
                     state.masterId = sender_id
                     if cmd.volume then state.volume = cmd.volume end
-                    table.insert(play_queue, {track = cmd.track, start_time = cmd.start_time})
+                    pending_play = {track = cmd.track, start_time = cmd.start_time}
 
                 elseif cmd.cmd == "stop" then
                     state.masterId = sender_id
                     state.playback_stop = true
-                    play_queue = {}
+                    pending_play = nil
+                    if stream_handle then
+                        pcall(function() stream_handle.close() end)
+                        stream_handle = nil
+                    end
                     for _, sp in ipairs(speakers) do
                         pcall(sp.stop)
                     end
