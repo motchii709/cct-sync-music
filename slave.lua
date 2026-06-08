@@ -259,6 +259,14 @@ local function downloadTrack(track)
     state.status = "DOWNLOADING"
     uiUpdate()
 
+    -- Delete old cache files to free space (Normal Computer only has ~125KB)
+    if fs.exists(CACHE_DIR) then
+        local files = fs.list(CACHE_DIR)
+        for _, f in ipairs(files) do
+            pcall(fs.delete, CACHE_DIR .. "/" .. f)
+        end
+    end
+
     local url = API_BASE_URL .. "?v=" .. VERSION .. "&id=" .. textutils.urlEncode(track_id)
     local ok, data = pcall(function()
         http.request({url = url, binary = true})
