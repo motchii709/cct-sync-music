@@ -21,6 +21,7 @@ local VERSION = "2.1"
 local PROTOCOL = "park_music"
 local CACHE_DIR = "cache"
 local CONFIG_FILE = ".slave_config"
+local HEARTBEAT_INTERVAL = 5
 
 ------------------------------------------------------------
 -- 初期化
@@ -43,9 +44,7 @@ if not zone_name then
     wf.close()
 end
 
-if not fs.exists(CACHE_DIR) then
-    fs.makeDir(CACHE_DIR)
-end
+if not fs.exists(CACHE_DIR) then fs.makeDir(CACHE_DIR) end
 
 local decoder = require("cc.audio.dfpwm").make_decoder()
 
@@ -108,9 +107,7 @@ end
 -- 音声DL
 ------------------------------------------------------------
 local function downloadTrack(track)
-    if isCached(track.id) then
-        return true
-    end
+    if isCached(track.id) then return true end
 
     log("DL: " .. track.name)
     state = "downloading"
@@ -149,9 +146,21 @@ local function downloadTrack(track)
 end
 
 ------------------------------------------------------------
--- 音声再生 (diskキャッシュから、start_timeまで待機して再生)
--- この関数は長時間ブロックする。
--- playback_stop フラグで途中停止可能。
+-- Rednet
+------------------------------------------------------------
+local function openRednet()
+    local modem = peripheral.find("modem")
+    if not modem then error("No wireless modem attached.", 0) end
+    rednet.open(peripheral.getName(modem))
+end
+
+local function sendMessage(msg)
+    msg.zone = zone_name
+    rednet.broadcast(textutils.serialize(msg), PROTOCOL)
+end
+
+------------------------------------------------------------
+-- 音声再生 + 状態通知
 ------------------------------------------------------------
 local function playFromCache(track, start_time)
     if not isCached(track.id) then
@@ -159,7 +168,6 @@ local function playFromCache(track, start_time)
         return
     end
 
-    -- 開始時刻まで待機
     if start_time then
         while playing and os.clock() < start_time do
             sleep(0.05)
@@ -173,6 +181,7 @@ local function playFromCache(track, start_time)
     current_track = track
     playback_stop = false
     drawUI()
+    sendMessage({type = "play_started", track = track})
 
     local f = fs.open(cachePath(track.id), "rb")
     local chunk_size = 16 * 1024
@@ -218,37 +227,14 @@ local function playFromCache(track, start_time)
     f.close()
     playing = false
     state = "idle"
+    current_track = nil
     drawUI()
-end
-
-------------------------------------------------------------
--- Rednet
-------------------------------------------------------------
-local function openRednet()
-    local modem = peripheral.find("modem")
-    if not modem then
-        error("No wireless modem attached.", 0)
-    end
-    rednet.open(peripheral.getName(modem))
-end
-
-local function sendMessage(msg)
-    msg.zone = zone_name
-    rednet.broadcast(textutils.serialize(msg), PROTOCOL)
+    log("Track ended")
+    sendMessage({type = "track_end"})
 end
 
 ------------------------------------------------------------
 -- メイン
--- 
--- 架構: 2つの_coroutine を parallel.waitForAny で並行実行
---   1. rednetLoop: 継続的にrednetメッセージを受信し、
---      コマンドに応じて再生要求をキューイング
---   2. audioLoop: 再生要求をキューから取り出して実行
---
--- これにより:
---   - 再生中でも rednetメッセージを受信できる
---   - stopコマンドで即座に再生停止可能
---   - play_at の start_time 待機中もコマンド受信可能
 ------------------------------------------------------------
 openRednet()
 drawUI()
@@ -256,7 +242,7 @@ log("Zone: " .. zone_name)
 log("Waiting...")
 sendMessage({type = "hello", zone = zone_name})
 
-local play_queue = {}  -- {track=..., start_time=...}
+local play_queue = {}
 
 local function rednetLoop()
     while true do
@@ -270,6 +256,8 @@ local function rednetLoop()
                     local dl_ok = downloadTrack(cmd.track)
                     if dl_ok then
                         sendMessage({type = "ready", track_id = cmd.track.id})
+                    else
+                        sendMessage({type = "status", state = "error"})
                     end
 
                 elseif cmd.cmd == "ping" then
@@ -286,11 +274,16 @@ local function rednetLoop()
                         speaker.stop()
                     end
                     state = "idle"
+                    current_track = nil
                     drawUI()
+                    sendMessage({type = "play_stopped"})
 
                 elseif cmd.cmd == "volume" and cmd.level then
                     volume = math.max(0, math.min(3, cmd.level))
                     drawUI()
+
+                elseif cmd.cmd == "heartbeat" then
+                    sendMessage({type = "heartbeat", state = state, track = current_track})
                 end
             end
         end

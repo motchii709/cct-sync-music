@@ -21,7 +21,8 @@ local VERSION = "2.1"
 local PROTOCOL = "park_music"
 local SYNC_LEAD_TIME = 3.0
 local RTT_SAMPLES = 3
-local HEARTBEAT_INTERVAL = 10
+local HEARTBEAT_INTERVAL = 5
+local SLAVE_TIMEOUT = 15
 
 ------------------------------------------------------------
 -- 状態
@@ -43,6 +44,7 @@ local last_search_url = nil
 local selected_result = nil
 local result_action_mode = false
 
+-- zones: {zone_name = {id, status, track, last_seen, offset, alive}}
 local zones = {}
 local playing_id = nil
 local is_loading = false
@@ -62,6 +64,49 @@ end
 
 local function broadcastCommand(cmd)
     rednet.broadcast(textutils.serialize(cmd), PROTOCOL)
+end
+
+local function sendToZone(zone_name, cmd)
+    if zones[zone_name] and zones[zone_name].id then
+        rednet.send(zones[zone_name].id, textutils.serialize(cmd), PROTOCOL)
+    end
+end
+
+------------------------------------------------------------
+-- 接続管理
+------------------------------------------------------------
+local function getAliveSlaves()
+    local alive = {}
+    for name, info in pairs(zones) do
+        if info.alive then
+            table.insert(alive, name)
+        end
+    end
+    return alive
+end
+
+local function getAliveSlaveCount()
+    local count = 0
+    for _, info in pairs(zones) do
+        if info.alive then count = count + 1 end
+    end
+    return count
+end
+
+local function markAllSlavesPlaying(track)
+    for name, info in pairs(zones) do
+        if info.alive then
+            info.status = "playing"
+            info.track = track
+        end
+    end
+end
+
+local function markAllSlavesStopped()
+    for name, info in pairs(zones) do
+        info.status = "idle"
+        info.track = nil
+    end
 end
 
 ------------------------------------------------------------
@@ -149,35 +194,32 @@ local function drawNowPlaying()
     if #queue > 0 then
         term.setTextColor(colors.lightGray)
         term.setCursorPos(2, 12)
-        term.write("--- Queue (" .. #queue .. " tracks) ---")
+        term.write("--- Queue (" .. #queue .. ") ---")
         for i = 1, math.min(#queue, 8) do
             term.setTextColor(colors.white)
             term.setCursorPos(2, 12 + i)
             term.write(i .. ". " .. queue[i].name)
         end
-        if #queue > 8 then
-            term.setTextColor(colors.lightGray)
-            term.setCursorPos(2, 21)
-            term.write("...+" .. (#queue - 8) .. " more")
-        end
     end
 
-    local zone_count = 0
-    for _ in pairs(zones) do zone_count = zone_count + 1 end
-    if zone_count > 0 then
+    local alive = getAliveSlaveCount()
+    if alive > 0 then
         term.setTextColor(colors.lightGray)
         term.setCursorPos(35, 3)
-        term.write("--- Zones ---")
+        term.write("--- Zones (" .. alive .. ") ---")
         local yi = 4
         for name, info in pairs(zones) do
+            if not info.alive then goto skip end
             if yi > height then break end
             term.setCursorPos(35, yi)
             local col = colors.white
             if info.status == "playing" then col = colors.lime
-            elseif info.status == "error" then col = colors.red end
+            elseif info.status == "error" then col = colors.red
+            elseif info.status == "downloading" then col = colors.yellow end
             term.setTextColor(col)
             term.write(name)
             yi = yi + 1
+            ::skip::
         end
     end
 end
@@ -259,16 +301,22 @@ local function drawZones()
     local found = false
     for name, info in pairs(zones) do
         found = true
-        if yi > height - 6 then break end
+        if yi > height - 7 then break end
         term.setTextColor(colors.white)
         term.setCursorPos(2, yi)
         term.write("Zone: " .. name)
         term.setCursorPos(2, yi + 1)
         local st = info.status or "unknown"
-        if st == "playing" then term.setTextColor(colors.lime)
-        elseif st == "error" then term.setTextColor(colors.red)
-        else term.setTextColor(colors.lightGray) end
-        term.write("Status:  " .. st)
+        if info.alive then
+            if st == "playing" then term.setTextColor(colors.lime)
+            elseif st == "error" then term.setTextColor(colors.red)
+            elseif st == "downloading" then term.setTextColor(colors.yellow)
+            else term.setTextColor(colors.white) end
+            term.write("Status:  " .. st)
+        else
+            term.setTextColor(colors.red)
+            term.write("Status:  DEAD")
+        end
         term.setTextColor(colors.lightGray)
         term.setCursorPos(2, yi + 2)
         term.write("Track:   " .. (info.track and info.track.name or "(none)"))
@@ -298,7 +346,13 @@ local function redrawScreen()
 end
 
 ------------------------------------------------------------
--- 同期再生
+-- 同期再生 (全Slave)
+--
+-- 3フェーズ:
+--   Phase 1: DL → ready応答を全Slaveから待つ
+--   Phase 2: RTT計測
+--   Phase 3: play_at 送信 → Slave再生開始確認を待つ
+--   Phase 4: track_end 待機 → 次の曲へ
 ------------------------------------------------------------
 local function syncLoop()
     while true do
@@ -306,8 +360,12 @@ local function syncLoop()
             local track = sync_request
             sync_request = nil
 
-            local slave_count = 0
-            for _ in pairs(zones) do slave_count = slave_count + 1 end
+            local slave_count = getAliveSlaveCount()
+            if slave_count == 0 then
+                is_loading = false
+                redrawScreen()
+                goto continue
+            end
 
             now_playing = track
             playing_id = track.id
@@ -315,77 +373,103 @@ local function syncLoop()
             is_error = false
             redrawScreen()
 
-            if slave_count == 0 then
-                is_loading = false
-                redrawScreen()
-            else
-                broadcastCommand({
-                    cmd = "download",
-                    track = {id = track.id, name = track.name, artist = track.artist}
-                })
+            -- Phase 1: DLコマンド送信
+            broadcastCommand({
+                cmd = "download",
+                track = {id = track.id, name = track.name, artist = track.artist}
+            })
 
-                local timeout = os.startTimer(30)
-                local ready_count = 0
-                while ready_count < slave_count do
-                    local ev, p1 = os.pullEvent()
-                    if ev == "timer" and p1 == timeout then break end
-                    ready_count = 0
+            -- 全Slaveのready応答を待つ (タイムアウト30秒)
+            local timeout = os.startTimer(30)
+            while true do
+                local ev, p1 = os.pullEvent()
+                if ev == "timer" and p1 == timeout then break end
+                -- rednetLoopがreadyを処理、zonesのstatusを更新
+                local all_ready = true
+                for _, info in pairs(zones) do
+                    if info.alive and info.status ~= "ready" then
+                        all_ready = false
+                        break
+                    end
+                end
+                if all_ready then break end
+            end
+            os.cancelTimer(timeout)
+
+            -- Phase 2: RTT計測
+            local max_offset = 0
+            for name, info in pairs(zones) do
+                if not info.alive then goto skip_rtt end
+                local total_rtt = 0
+                local valid = 0
+                for s = 1, RTT_SAMPLES do
+                    rtt_pong_received = false
+                    sendToZone(name, {cmd = "ping", seq = s})
+                    local t = os.startTimer(2)
+                    local st = os.clock()
+                    while not rtt_pong_received do
+                        local ev, p1 = os.pullEvent()
+                        if ev == "timer" and p1 == t then break end
+                    end
+                    os.cancelTimer(t)
+                    if rtt_pong_received then
+                        total_rtt = total_rtt + (os.clock() - st)
+                        valid = valid + 1
+                    end
+                end
+                if valid > 0 then
+                    local avg = total_rtt / valid
+                    zones[name].offset = avg / 2
+                    if avg / 2 > max_offset then max_offset = avg / 2 end
+                end
+                ::skip_rtt::
+            end
+
+            -- Phase 3: play_at 送信
+            local start_time = os.clock() + max_offset + SYNC_LEAD_TIME
+            broadcastCommand({
+                cmd = "play_at",
+                track = {id = track.id, name = track.name, artist = track.artist},
+                start_time = start_time,
+                volume = volume
+            })
+
+            markAllSlavesPlaying(track)
+            playing = true
+            is_loading = false
+            redrawScreen()
+
+            -- Phase 4: track_end を待つ
+            -- Slaveからのtrack_endメッセージか、全Slaveがidleになるのを監視
+            while playing do
+                local ev = os.pullEvent()
+                if ev == "track_end" then
+                    -- 全Slaveが再生終了したかチェック
+                    local all_done = true
                     for _, info in pairs(zones) do
-                        if info.status then ready_count = ready_count + 1 end
-                    end
-                end
-                os.cancelTimer(timeout)
-
-                local max_offset = 0
-                for name, info in pairs(zones) do
-                    local total_rtt = 0
-                    local valid = 0
-                    for s = 1, RTT_SAMPLES do
-                        rtt_pong_received = false
-                        broadcastCommand({cmd = "ping", seq = s})
-                        local t = os.startTimer(2)
-                        local st = os.clock()
-                        while not rtt_pong_received do
-                            local ev, p1 = os.pullEvent()
-                            if ev == "timer" and p1 == t then break end
-                        end
-                        os.cancelTimer(t)
-                        if rtt_pong_received then
-                            total_rtt = total_rtt + (os.clock() - st)
-                            valid = valid + 1
+                        if info.alive and info.status == "playing" then
+                            all_done = false
+                            break
                         end
                     end
-                    if valid > 0 then
-                        local avg = total_rtt / valid
-                        zones[name].offset = avg / 2
-                        if avg / 2 > max_offset then max_offset = avg / 2 end
-                    end
-                end
-
-                local start_time = os.clock() + max_offset + SYNC_LEAD_TIME
-                broadcastCommand({
-                    cmd = "play_at",
-                    track = {id = track.id, name = track.name, artist = track.artist},
-                    start_time = start_time,
-                    volume = volume
-                })
-
-                playing = true
-                is_loading = false
-                redrawScreen()
-
-                -- 曲が終わるかstopされるまで待機
-                while playing do
-                    sleep(0.5)
-                end
-
-                -- 次の曲があれば自動再生
-                if #queue > 0 then
-                    local next_track = queue[1]
-                    table.remove(queue, 1)
-                    sync_request = next_track
+                    if all_done then break end
+                elseif ev == "stop_requested" then
+                    break
                 end
             end
+
+            playing = false
+            markAllSlavesStopped()
+            redrawScreen()
+
+            -- 次の曲があれば自動再生
+            if #queue > 0 then
+                local next_track = queue[1]
+                table.remove(queue, 1)
+                sync_request = next_track
+            end
+
+            ::continue::
         else
             sleep(0.1)
         end
@@ -405,26 +489,77 @@ local function rednetLoop()
         if sender_id and message then
             local ok, msg = pcall(textutils.unserialize, message)
             if ok and msg then
-                if msg.type == "ready" then
+                if msg.type == "hello" then
                     if not zones[msg.zone] then zones[msg.zone] = {} end
                     zones[msg.zone].id = sender_id
                     zones[msg.zone].last_seen = os.clock()
-                    zones[msg.zone].status = "ready"
+                    zones[msg.zone].alive = true
+                    if not zones[msg.zone].status then
+                        zones[msg.zone].status = "connected"
+                    end
                     redrawScreen()
+
+                elseif msg.type == "heartbeat" then
+                    if zones[msg.zone] then
+                        zones[msg.zone].last_seen = os.clock()
+                        zones[msg.zone].alive = true
+                        zones[msg.zone].status = msg.state
+                        if msg.track then
+                            zones[msg.zone].track = msg.track
+                        end
+                        redrawScreen()
+                    end
+
+                elseif msg.type == "ready" then
+                    if zones[msg.zone] then
+                        zones[msg.zone].status = "ready"
+                        zones[msg.zone].last_seen = os.clock()
+                        redrawScreen()
+                    end
+
                 elseif msg.type == "pong" then
                     rtt_pong_received = true
-                elseif msg.type == "status" then
-                    if not zones[msg.zone] then zones[msg.zone] = {} end
-                    zones[msg.zone].id = sender_id
-                    zones[msg.zone].status = msg.state
-                    zones[msg.zone].track = msg.track
-                    zones[msg.zone].last_seen = os.clock()
-                    redrawScreen()
-                elseif msg.type == "hello" then
-                    if not zones[msg.zone] then zones[msg.zone] = {} end
-                    zones[msg.zone].id = sender_id
-                    zones[msg.zone].last_seen = os.clock()
-                    zones[msg.zone].status = "connected"
+
+                elseif msg.type == "track_end" then
+                    if zones[msg.zone] then
+                        zones[msg.zone].status = "idle"
+                        zones[msg.zone].track = nil
+                        zones[msg.zone].last_seen = os.clock()
+                        redrawScreen()
+                        os.queueEvent("track_end")
+                    end
+
+                elseif msg.type == "play_started" then
+                    if zones[msg.zone] then
+                        zones[msg.zone].status = "playing"
+                        zones[msg.zone].track = msg.track
+                        zones[msg.zone].last_seen = os.clock()
+                        redrawScreen()
+                    end
+
+                elseif msg.type == "play_stopped" then
+                    if zones[msg.zone] then
+                        zones[msg.zone].status = "idle"
+                        zones[msg.zone].track = nil
+                        zones[msg.zone].last_seen = os.clock()
+                        redrawScreen()
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- 存活管理: 一定時間heartbeatが来ないSlaveをdeadにする
+local function aliveCheckLoop()
+    while true do
+        sleep(HEARTBEAT_INTERVAL)
+        for name, info in pairs(zones) do
+            if info.alive then
+                local elapsed = os.clock() - (info.last_seen or 0)
+                if elapsed > SLAVE_TIMEOUT then
+                    info.alive = false
+                    info.status = "dead"
                     redrawScreen()
                 end
             end
@@ -435,19 +570,15 @@ end
 local function httpLoop()
     while true do
         local ev, p1, p2 = os.pullEvent()
-        if ev == "http_success" then
-            if p1 == last_search_url then
-                search_results = textutils.unserialiseJSON(p2.readAll())
-                search_waiting = false
-                search_error = false
-                redrawScreen()
-            end
-        elseif ev == "http_failure" then
-            if p1 == last_search_url then
-                search_error = true
-                search_waiting = false
-                redrawScreen()
-            end
+        if ev == "http_success" and p1 == last_search_url then
+            search_results = textutils.unserialiseJSON(p2.readAll())
+            search_waiting = false
+            search_error = false
+            redrawScreen()
+        elseif ev == "http_failure" and p1 == last_search_url then
+            search_error = true
+            search_waiting = false
+            redrawScreen()
         end
     end
 end
@@ -478,6 +609,7 @@ local function mouseLoop()
                     if playing then
                         playing = false
                         broadcastCommand({cmd = "stop"})
+                        os.queueEvent("stop_requested")
                     elseif now_playing then
                         sync_request = now_playing
                     elseif #queue > 0 then
@@ -489,6 +621,7 @@ local function mouseLoop()
                 elseif x >= 10 and x < 16 then
                     broadcastCommand({cmd = "stop"})
                     playing = false
+                    os.queueEvent("stop_requested")
                     if #queue > 0 then
                         now_playing = queue[1]
                         table.remove(queue, 1)
@@ -593,6 +726,7 @@ parallel.waitForAny(
     rednetLoop,
     httpLoop,
     heartbeatLoop,
+    aliveCheckLoop,
     mouseLoop,
     dragLoop,
     syncLoop
