@@ -319,19 +319,27 @@ local function playStream(track, delay)
     sendToMaster({type = "play_started", track = track})
 
     local decoder = require("cc.audio.dfpwm").make_decoder()
-    local chunk_size = 16 * 1024
+    local chunk_size = 4 * 1024
+    local bytes_read = 0
 
     local ok, err = pcall(function()
         while not state.playback_stop do
             local chunk = stream_handle.read(chunk_size)
-            if not chunk then break end
+            if not chunk then
+                logMsg("Stream end (" .. bytes_read .. " bytes)")
+                break
+            end
+            bytes_read = bytes_read + #chunk
 
-            local decoded = decoder(chunk)
-            if decoded then
+            local decode_ok, decoded = pcall(decoder, chunk)
+            if not decode_ok then
+                logMsg("Decode err at " .. bytes_read .. "B: " .. tostring(decoded))
+                break
+            end
+            if decoded and #decoded > 0 then
                 for _, sp in ipairs(speakers) do
                     pcall(sp.playAudio, decoded, state.volume)
                 end
-                -- Wait for speakers to finish
                 while not state.playback_stop do
                     local any_busy = false
                     for _, sp in ipairs(speakers) do
