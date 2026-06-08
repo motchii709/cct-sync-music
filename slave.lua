@@ -35,33 +35,39 @@ local computer_name = nil
 do
     local f = fs.open(CONFIG_FILE, "r")
     if f then
-        group_name = f.readLine()
-        computer_name = f.readLine() or "Slave"
+        local g = f.readLine()
+        local c = f.readLine()
         f.close()
+        if g and #g > 0 then group_name = g end
+        if c and #c > 0 then computer_name = c end
     end
+end
+if not group_name or not computer_name then
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("=== Theme Park Music - Slave ===")
+    print("")
     if not group_name then
-        term.setBackgroundColor(colors.black)
-        term.setTextColor(colors.white)
-        term.clear()
-        term.setCursorPos(1, 1)
-        print("=== Theme Park Music - Slave ===")
-        print("")
         print("Group name:")
         term.setCursorPos(1, 4)
         term.clearLine()
         group_name = read()
         if #group_name == 0 then error("Group name required.", 0) end
+    end
+    if not computer_name then
         print("")
         print("Computer name (e.g. 'Front Gate'):")
         term.setCursorPos(1, 7)
         term.clearLine()
         computer_name = read()
         if #computer_name == 0 then computer_name = "Slave" end
-        local wf = fs.open(CONFIG_FILE, "w")
-        wf.write(group_name .. "\n")
-        wf.write(computer_name)
-        wf.close()
     end
+    local wf = fs.open(CONFIG_FILE, "w")
+    wf.write(group_name .. "\n")
+    wf.write(computer_name)
+    wf.close()
 end
 
 if not fs.exists(CACHE_DIR) then fs.makeDir(CACHE_DIR) end
@@ -111,7 +117,7 @@ local function drawUI()
     term.setBackgroundColor(colors.gray)
     term.clearLine()
     term.setCursorPos(2, 1)
-    term.write("=== " .. computer_name .. " ===")
+    term.write("=== " .. (computer_name or "Slave") .. " ===")
 
     -- ステータス
     local yi = 3
