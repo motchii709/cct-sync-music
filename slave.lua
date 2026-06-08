@@ -43,14 +43,23 @@ do
         end
     end)
     if ok and result then
-        local f = fs.open(SELF_NAME, "w")
-        if f then
-            f.write(result)
-            f.close()
-            print("Updated! Restarting...")
-            sleep(1)
-            shell.run(SELF_NAME)
-            return
+        -- 現在のファイル内容と比較して変わらなければスキップ
+        local current = nil
+        local cf = fs.open(SELF_NAME, "r")
+        if cf then
+            current = cf.readAll()
+            cf.close()
+        end
+        if current ~= result then
+            local f = fs.open(SELF_NAME, "w")
+            if f then
+                f.write(result)
+                f.close()
+                print("Updated! Restarting...")
+                sleep(1)
+                shell.run(SELF_NAME)
+                return
+            end
         end
     end
     print("Using current version.")
