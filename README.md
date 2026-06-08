@@ -36,7 +36,7 @@ wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.l
 master
 ```
 
-初回起動時にグループ名を入力。**毎回起動時にGitHubから自動更新される。**
+初回起動時にグループ名を入力。
 
 ### 2. Slave
 
@@ -52,7 +52,7 @@ wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lu
 slave
 ```
 
-初回起動時にグループ名とコンピュータ名を入力。**毎回起動時にGitHubから自動更新される。**
+初回起動時にグループ名とコンピュータ名を入力。
 
 ### 3. 曲を選ぶ
 
@@ -63,6 +63,18 @@ Masterの画面で「Playlist」タブをクリック → YouTubeのURL貼るか
 「Now Playing」タブ → 「Sync All」ボタン。
 
 これで全Slaveに同期コマンドが飛んで、同時に再生開始する。
+
+## 更新方法
+
+各Computerで再ダウンロードするだけ。
+
+```
+wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua master
+```
+
+```
+wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua slave
+```
 
 ## TUI
 
