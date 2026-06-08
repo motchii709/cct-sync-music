@@ -5,10 +5,10 @@
   Masterからのコマンドを受信し、音声を再生する。
   rednet (Wireless Modem) で通信。
   
-  使い方:
+   使い方:
     1. Wireless ModemをComputerに取り付ける
     2. SpeakerをComputerに接続する
-    3. wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua
+    3. wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua slave
     4. 以降は `slave` で起動 (自動更新される)
 ]]
 

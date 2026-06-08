@@ -5,9 +5,9 @@
   複数のSlave Computerをrednet経由で制御し、
   音楽を同期再生する。
   
-  使い方:
+   使い方:
     1. Wireless ModemをComputerに取り付ける
-    2. wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua
+    2. wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua master
     3. 以降は `master` で起動 (自動更新される)
 ]]
 

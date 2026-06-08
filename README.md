@@ -27,22 +27,32 @@ SpeakerはComputerの横に直接置いてOK。Wireless Modemも右クリック�
 Advanced Computerを右クリックして開く。
 
 ```
-wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua
+wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua master
 ```
 
-初回起動時にグループ名を入力。以降は `master` で起動。
-**毎回起動時にGitHubから自動更新される。**
+ファイルが保存される。以降は `master` と打つだけ。
+
+```
+master
+```
+
+初回起動時にグループ名を入力。**毎回起動時にGitHubから自動更新される。**
 
 ### 2. Slave
 
 各Normal Computerを右クリックして開く。
 
 ```
-wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua
+wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua slave
 ```
 
-初回起動時にグループ名とコンピュータ名を入力。以降は `slave` で起動。
-**毎回起動時にGitHubから自動更新される。**
+ファイルが保存される。以降は `slave` と打つだけ。
+
+```
+slave
+```
+
+初回起動時にグループ名とコンピュータ名を入力。**毎回起動時にGitHubから自動更新される。**
 
 ### 3. 曲を選ぶ
 
