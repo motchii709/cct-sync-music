@@ -380,11 +380,8 @@ local function syncLoop()
             })
 
             -- 全Slaveのready応答を待つ (タイムアウト30秒)
-            local timeout = os.startTimer(30)
+            local deadline = os.clock() + 30
             while true do
-                local ev, p1 = os.pullEvent()
-                if ev == "timer" and p1 == timeout then break end
-                -- rednetLoopがreadyを処理、zonesのstatusを更新
                 local all_ready = true
                 for _, info in pairs(zones) do
                     if info.alive and info.status ~= "ready" then
@@ -393,8 +390,9 @@ local function syncLoop()
                     end
                 end
                 if all_ready then break end
+                if os.clock() > deadline then break end
+                sleep(0.1)
             end
-            os.cancelTimer(timeout)
 
             -- Phase 2: RTT計測
             local max_offset = 0
@@ -405,13 +403,10 @@ local function syncLoop()
                 for s = 1, RTT_SAMPLES do
                     rtt_pong_received = false
                     sendToZone(name, {cmd = "ping", seq = s})
-                    local t = os.startTimer(2)
                     local st = os.clock()
-                    while not rtt_pong_received do
-                        local ev, p1 = os.pullEvent()
-                        if ev == "timer" and p1 == t then break end
+                    while not rtt_pong_received and os.clock() - st < 2 do
+                        sleep(0.1)
                     end
-                    os.cancelTimer(t)
                     if rtt_pong_received then
                         total_rtt = total_rtt + (os.clock() - st)
                         valid = valid + 1
@@ -442,20 +437,15 @@ local function syncLoop()
             -- Phase 4: track_end を待つ
             -- Slaveからのtrack_endメッセージか、全Slaveがidleになるのを監視
             while playing do
-                local ev = os.pullEvent()
-                if ev == "track_end" then
-                    -- 全Slaveが再生終了したかチェック
-                    local all_done = true
-                    for _, info in pairs(zones) do
-                        if info.alive and info.status == "playing" then
-                            all_done = false
-                            break
-                        end
+                local all_done = true
+                for _, info in pairs(zones) do
+                    if info.alive and info.status == "playing" then
+                        all_done = false
+                        break
                     end
-                    if all_done then break end
-                elseif ev == "stop_requested" then
-                    break
                 end
+                if all_done then break end
+                sleep(0.1)
             end
 
             playing = false

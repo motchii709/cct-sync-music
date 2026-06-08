@@ -22,6 +22,7 @@ local PROTOCOL = "park_music"
 local CACHE_DIR = "cache"
 local CONFIG_FILE = ".slave_config"
 local HEARTBEAT_INTERVAL = 5
+local DL_TIMEOUT = 30
 
 ------------------------------------------------------------
 -- 初期化
@@ -46,8 +47,6 @@ end
 
 if not fs.exists(CACHE_DIR) then fs.makeDir(CACHE_DIR) end
 
-local decoder = require("cc.audio.dfpwm").make_decoder()
-
 local speakers = { peripheral.find("speaker") }
 if #speakers == 0 then
     error("No speakers attached.", 0)
@@ -60,6 +59,8 @@ local volume = 1.0
 local playing = false
 local master_id = nil
 local playback_stop = false
+local play_queue = {}
+local last_master_time = 0
 
 ------------------------------------------------------------
 -- UI
@@ -104,7 +105,23 @@ local function isCached(track_id)
 end
 
 ------------------------------------------------------------
--- 音声DL
+-- Rednet
+------------------------------------------------------------
+local function openRednet()
+    local modem = peripheral.find("modem")
+    if not modem then error("No wireless modem attached.", 0) end
+    rednet.open(peripheral.getName(modem))
+end
+
+local function sendMessage(msg)
+    local out = {}
+    for k, v in pairs(msg) do out[k] = v end
+    out.zone = zone_name
+    rednet.broadcast(textutils.serialize(out), PROTOCOL)
+end
+
+------------------------------------------------------------
+-- 音声DL (別コルーチンで実行)
 ------------------------------------------------------------
 local function downloadTrack(track)
     if isCached(track.id) then return true end
@@ -116,7 +133,7 @@ local function downloadTrack(track)
     local url = API_BASE_URL .. "?v=" .. VERSION .. "&id=" .. textutils.urlEncode(track.id)
     http.request({url = url, binary = true})
 
-    local timer = os.startTimer(30)
+    local timer = os.startTimer(DL_TIMEOUT)
     while true do
         local ev, p1, p2 = os.pullEvent()
         if ev == "http_success" and p1 == url then
@@ -146,21 +163,7 @@ local function downloadTrack(track)
 end
 
 ------------------------------------------------------------
--- Rednet
-------------------------------------------------------------
-local function openRednet()
-    local modem = peripheral.find("modem")
-    if not modem then error("No wireless modem attached.", 0) end
-    rednet.open(peripheral.getName(modem))
-end
-
-local function sendMessage(msg)
-    msg.zone = zone_name
-    rednet.broadcast(textutils.serialize(msg), PROTOCOL)
-end
-
-------------------------------------------------------------
--- 音声再生 + 状態通知
+-- 音声再生
 ------------------------------------------------------------
 local function playFromCache(track, start_time)
     if not isCached(track.id) then
@@ -168,6 +171,7 @@ local function playFromCache(track, start_time)
         return
     end
 
+    -- start_timeまで待機
     if start_time then
         while playing and os.clock() < start_time do
             sleep(0.05)
@@ -180,51 +184,69 @@ local function playFromCache(track, start_time)
     state = "playing"
     current_track = track
     playback_stop = false
+    playing = true
     drawUI()
     sendMessage({type = "play_started", track = track})
 
+    -- デコーダを新規作成 (前回の状態をリセット)
+    local decoder = require("cc.audio.dfpwm").make_decoder()
+
     local f = fs.open(cachePath(track.id), "rb")
-    local chunk_size = 16 * 1024
-    local first_chunk = f.read(4)
-    local read_size = chunk_size - 4
-
-    while playing and not playback_stop do
-        local chunk = f.read(read_size)
-        if not chunk then break end
-
-        local decoded
-        if first_chunk then
-            decoded = decoder(first_chunk .. chunk)
-            first_chunk = nil
-            read_size = chunk_size
-        else
-            decoded = decoder(chunk)
-        end
-
-        local fns = {}
-        for i, speaker in ipairs(speakers) do
-            fns[i] = function()
-                local name = peripheral.getName(speaker)
-                while not speaker.playAudio(decoded, volume) do
-                    parallel.waitForAny(
-                        function()
-                            repeat until select(2, os.pullEvent("speaker_audio_empty")) == name
-                        end,
-                        function()
-                            local ev = os.pullEvent()
-                            if ev == "playback_stopped" then return end
-                        end
-                    )
-                    if playback_stop then return end
-                end
-            end
-        end
-
-        local ok = pcall(parallel.waitForAll, table.unpack(fns))
-        if not ok then break end
+    if not f then
+        log("Cannot open cache: " .. track.id)
+        state = "idle"
+        playing = false
+        current_track = nil
+        drawUI()
+        sendMessage({type = "track_end"})
+        return
     end
 
+    local ok, err = pcall(function()
+        local chunk_size = 16 * 1024
+
+        while playing and not playback_stop do
+            local chunk = f.read(chunk_size)
+            if not chunk then break end
+
+            local decoded = decoder(chunk)
+
+            local fns = {}
+            for i, speaker in ipairs(speakers) do
+                fns[i] = function()
+                    local name = peripheral.getName(speaker)
+                    while not speaker.playAudio(decoded, volume) do
+                        parallel.waitForAny(
+                            function()
+                                -- speaker_audio_empty を受け取るまで待機
+                                while true do
+                                    local ev, p1 = os.pullEvent("speaker_audio_empty")
+                                    if p1 == name then return end
+                                end
+                            end,
+                            function()
+                                -- playback_stopped を受け取るまで待機
+                                while true do
+                                    local ev = os.pullEvent()
+                                    if ev == "playback_stopped" then return end
+                                end
+                            end
+                        )
+                        if playback_stop then return end
+                    end
+                end
+            end
+
+            parallel.waitForAll(table.unpack(fns))
+        end
+    end)
+
     f.close()
+
+    if not ok then
+        log("Playback error: " .. tostring(err))
+    end
+
     playing = false
     state = "idle"
     current_track = nil
@@ -242,8 +264,6 @@ log("Zone: " .. zone_name)
 log("Waiting...")
 sendMessage({type = "hello", zone = zone_name})
 
-local play_queue = {}
-
 local function rednetLoop()
     while true do
         local sender_id, message, protocol = rednet.receive(PROTOCOL)
@@ -251,8 +271,10 @@ local function rednetLoop()
             local ok, cmd = pcall(textutils.unserialize, message)
             if ok and cmd and not cmd.type then
                 master_id = sender_id
+                last_master_time = os.clock()
 
                 if cmd.cmd == "download" and cmd.track then
+                    -- DLは直接実行 (parallelで囲むとrednetLoopが止まる)
                     local dl_ok = downloadTrack(cmd.track)
                     if dl_ok then
                         sendMessage({type = "ready", track_id = cmd.track.id})
@@ -270,6 +292,7 @@ local function rednetLoop()
                 elseif cmd.cmd == "stop" then
                     playback_stop = true
                     playing = false
+                    play_queue = {}
                     for _, speaker in ipairs(speakers) do
                         speaker.stop()
                     end
