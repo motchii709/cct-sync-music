@@ -36,7 +36,7 @@ do
     local f = fs.open(CONFIG_FILE, "r")
     if f then
         group_name = f.readLine()
-        computer_name = f.readLine()
+        computer_name = f.readLine() or "Slave"
         f.close()
     end
     if not group_name then
