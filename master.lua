@@ -1,9 +1,12 @@
 --[[
-  Theme Park Music System - Master v3
+  Theme Park Music System - Master v3 (Audio Relay)
   Advanced Computer only (colors + mouse)
 
   Controls multiple Slave Computers over wireless rednet
   to play synchronized music.
+
+  Master downloads audio from Firebase, caches it locally,
+  then broadcasts raw DFPWM chunks to slaves over rednet.
 
   Usage:
     1. Attach Wireless Modem to Computer
@@ -23,7 +26,8 @@ local HEARTBEAT_INTERVAL = 5
 local SLAVE_TIMEOUT = 15
 local CONFIG_FILE = ".master_config"
 local LOG_MAX = 50
-local DL_TIMEOUT = 30
+local DL_TIMEOUT = 60
+local CACHE_DIR = "cache"
 
 ------------------------------------------------------------
 -- Initialization
@@ -34,6 +38,10 @@ term.setBackgroundColor(colors.black)
 term.setTextColor(colors.white)
 term.clear()
 term.setCursorPos(1, 1)
+
+if not fs.exists(CACHE_DIR) then
+    fs.makeDir(CACHE_DIR)
+end
 
 local group_name = nil
 do
@@ -66,6 +74,7 @@ local playing = false
 local now_playing = nil
 local queue = {}
 local volume = 1.5
+local downloading = false
 
 -- Search
 local search_query = ""
@@ -165,6 +174,94 @@ local function sendTo(id, cmd)
 end
 
 ------------------------------------------------------------
+-- Audio Download
+------------------------------------------------------------
+local function downloadTrack(track)
+    local track_id = track.id
+    -- Delete old cache
+    if fs.exists(CACHE_DIR) then
+        local files = fs.list(CACHE_DIR)
+        for _, f in ipairs(files) do
+            pcall(fs.delete, CACHE_DIR .. "/" .. f)
+        end
+    end
+
+    local url = API_BASE_URL .. "?v=" .. VERSION .. "&id=" .. textutils.urlEncode(track_id)
+    http.request({url = url, binary = true})
+
+    local timer = os.startTimer(DL_TIMEOUT)
+    while true do
+        local ev, p1, p2 = os.pullEvent()
+        if ev == "http_success" and p1 == url then
+            local data = p2.readAll()
+            p2.close()
+            os.cancelTimer(timer)
+            if data and #data > 0 then
+                local path = CACHE_DIR .. "/" .. track_id .. ".dfpwm"
+                local wf = fs.open(path, "wb")
+                if wf then
+                    wf.write(data)
+                    wf.close()
+                    log("Downloaded: " .. track_id .. " (" .. #data .. " bytes)")
+                    return true
+                end
+            end
+            return false
+        elseif ev == "http_failure" and p1 == url then
+            os.cancelTimer(timer)
+            log("Download failed: " .. track_id)
+            return false
+        elseif ev == "timer" and p1 == timer then
+            log("Download timeout: " .. track_id)
+            return false
+        end
+    end
+end
+
+------------------------------------------------------------
+-- Audio Broadcast
+------------------------------------------------------------
+local function broadcastAudio(track)
+    local path = CACHE_DIR .. "/" .. track.id .. ".dfpwm"
+    if not fs.exists(path) then
+        log("Cache miss: " .. track.id)
+        return
+    end
+
+    local f = fs.open(path, "rb")
+    if not f then
+        log("Cannot open cache: " .. track.id)
+        return
+    end
+
+    local chunk_size = 16 * 1024  -- 16KB
+    local bytes_per_sec = 6000    -- DFPWM 48kHz
+    local chunk_interval = chunk_size / bytes_per_sec  -- ~2.67 seconds
+
+    log("Broadcasting audio...")
+
+    while true do
+        local chunk = f.read(chunk_size)
+        if not chunk then break end
+
+        -- Send raw binary via rednet broadcast
+        rednet.broadcast(chunk, PROTOCOL)
+
+        -- Pace broadcast to playback rate
+        local send_time = os.clock()
+        while os.clock() - send_time < chunk_interval do
+            sleep(0.1)
+        end
+    end
+
+    f.close()
+
+    -- Send end marker
+    broadcastCommand({cmd = "audio_end"})
+    log("Audio broadcast complete")
+end
+
+------------------------------------------------------------
 -- UI: Tab bar
 ------------------------------------------------------------
 local function drawTabs()
@@ -206,7 +303,9 @@ local function drawNowPlaying()
         safeWrite("No track selected", 2, 3, colors.lightGray)
     end
 
-    if is_loading then
+    if downloading then
+        safeWrite("Downloading...", 2, 5, colors.yellow)
+    elseif is_loading then
         safeWrite("Loading...", 2, 5, colors.yellow)
     elseif is_error then
         safeWrite("Error", 2, 5, colors.red)
@@ -215,7 +314,7 @@ local function drawNowPlaying()
     -- Play/Stop button
     if playing then
         safeWrite(" Stop ", 2, 6, colors.white, colors.gray)
-    elseif is_loading then
+    elseif downloading or is_loading then
         safeWrite(" Cancel ", 2, 6, colors.white, colors.gray)
     else
         safeWrite(" Play ", 2, 6, colors.white, colors.gray)
@@ -403,96 +502,104 @@ local function syncLoop()
                 playing_id = track.id
                 is_loading = true
                 is_error = false
+                downloading = true
                 log("Starting: " .. (track.name or track.id))
                 scheduleRedraw()
 
-                broadcastCommand({
-                    cmd = "download",
-                    track = {id = track.id, name = track.name, artist = track.artist}
-                })
+                -- Step 1: Download audio to master cache
+                local dl_ok = downloadTrack(track)
+                if not dl_ok then
+                    downloading = false
+                    is_loading = false
+                    is_error = true
+                    log("Download failed: " .. (track.name or track.id))
+                    scheduleRedraw()
+                else
+                    downloading = false
+                    scheduleRedraw()
 
-                -- Wait for all alive slaves to be ready
-                local deadline = os.clock() + DL_TIMEOUT
-                while true do
-                    local all_ready = true
-                    for _, info in pairs(slaves) do
-                        if info.alive and info.status ~= "ready" then
-                            all_ready = false
+                    -- Step 2: Tell slaves to prepare
+                    broadcastCommand({
+                        cmd = "download",
+                        track = {id = track.id, name = track.name, artist = track.artist}
+                    })
+
+                    -- Wait for all alive slaves to be ready
+                    local deadline = os.clock() + DL_TIMEOUT
+                    while true do
+                        local all_ready = true
+                        for _, info in pairs(slaves) do
+                            if info.alive and info.status ~= "ready" then
+                                all_ready = false
+                                break
+                            end
+                        end
+                        if all_ready then break end
+                        if os.clock() > deadline then
+                            log("DL timeout")
                             break
                         end
+                        sleep(0.1)
                     end
-                    if all_ready then break end
-                    if os.clock() > deadline then
-                        log("DL timeout")
-                        break
-                    end
-                    sleep(0.1)
-                end
 
-                -- RTT measurement
-                local max_offset = 0
-                for id, info in pairs(slaves) do
-                    if not info.alive then goto skip_rtt end
-                    local total_rtt = 0
-                    local valid = 0
-                    for s = 1, RTT_SAMPLES do
-                        rtt_pong_by_id[id] = nil
-                        sendTo(id, {cmd = "ping", seq = s})
-                        local st = os.clock()
-                        while rtt_pong_by_id[id] ~= s and os.clock() - st < 2 do
-                            sleep(0.1)
+                    -- Step 3: RTT measurement
+                    local max_offset = 0
+                    for id, info in pairs(slaves) do
+                        if not info.alive then goto skip_rtt end
+                        local total_rtt = 0
+                        local valid = 0
+                        for s = 1, RTT_SAMPLES do
+                            rtt_pong_by_id[id] = nil
+                            sendTo(id, {cmd = "ping", seq = s})
+                            local st = os.clock()
+                            while rtt_pong_by_id[id] ~= s and os.clock() - st < 2 do
+                                sleep(0.1)
+                            end
+                            if rtt_pong_by_id[id] == s then
+                                total_rtt = total_rtt + (os.clock() - st)
+                                valid = valid + 1
+                            end
                         end
-                        if rtt_pong_by_id[id] == s then
-                            total_rtt = total_rtt + (os.clock() - st)
-                            valid = valid + 1
+                        if valid > 0 then
+                            local avg = total_rtt / valid
+                            slaves[id].offset = avg / 2
+                            if avg / 2 > max_offset then max_offset = avg / 2 end
                         end
+                        ::skip_rtt::
                     end
-                    if valid > 0 then
-                        local avg = total_rtt / valid
-                        slaves[id].offset = avg / 2
-                        if avg / 2 > max_offset then max_offset = avg / 2 end
+
+                    -- Step 4: Send play_at
+                    local delay = max_offset + SYNC_LEAD_TIME
+                    log("Play at: " .. string.format("+%.1fs", delay))
+                    broadcastCommand({
+                        cmd = "play_at",
+                        track = {id = track.id, name = track.name, artist = track.artist},
+                        delay = delay,
+                        volume = volume
+                    })
+
+                    markAllPlaying(track)
+                    playing = true
+                    is_loading = false
+                    scheduleRedraw()
+
+                    -- Step 5: Broadcast audio chunks
+                    broadcastAudio(track)
+
+                    -- Wait a bit for slaves to finish
+                    sleep(2)
+
+                    playing = false
+                    markAllStopped()
+                    log("Track ended: " .. (track.name or ""))
+                    scheduleRedraw()
+
+                    -- Auto-play next
+                    if #queue > 0 then
+                        local next_track = queue[1]
+                        table.remove(queue, 1)
+                        sync_request = next_track
                     end
-                    ::skip_rtt::
-                end
-
-                -- Send play_at
-                local delay = max_offset + SYNC_LEAD_TIME
-                log("Play at: " .. string.format("+%.1fs", delay))
-                broadcastCommand({
-                    cmd = "play_at",
-                    track = {id = track.id, name = track.name, artist = track.artist},
-                    delay = delay,
-                    volume = volume
-                })
-
-                markAllPlaying(track)
-                playing = true
-                is_loading = false
-                scheduleRedraw()
-
-                -- Wait for track_end
-                while playing do
-                    local all_done = true
-                    for _, info in pairs(slaves) do
-                        if info.alive and info.status == "playing" then
-                            all_done = false
-                            break
-                        end
-                    end
-                    if all_done then break end
-                    sleep(0.1)
-                end
-
-                playing = false
-                markAllStopped()
-                log("Track ended: " .. (track.name or ""))
-                scheduleRedraw()
-
-                -- Auto-play next
-                if #queue > 0 then
-                    local next_track = queue[1]
-                    table.remove(queue, 1)
-                    sync_request = next_track
                 end
             end
         else
@@ -508,72 +615,77 @@ local function rednetLoop()
     while true do
         local sender_id, message, protocol = rednet.receive(PROTOCOL)
         if sender_id and message then
-            local ok, msg = pcall(textutils.unserialize, message)
-            if ok and msg and msg.group == group_name then
-                if msg.type == "hello" then
-                    if not slaves[sender_id] then
-                        slaves[sender_id] = {id = sender_id}
-                        log("Slave connected: ID " .. sender_id)
-                    end
-                    slaves[sender_id].last_seen = os.clock()
-                    slaves[sender_id].alive = true
-                    slaves[sender_id].name = msg.name or ("Slave " .. sender_id)
-                    if not slaves[sender_id].status then
-                        slaves[sender_id].status = "connected"
-                    end
-                    sendTo(sender_id, {cmd = "welcome"})
-                    scheduleRedraw()
-
-                elseif msg.type == "heartbeat" then
-                    if slaves[sender_id] then
+            -- Check if it's a protocol message (starts with '{') or audio data
+            local first_byte = string.byte(message, 1)
+            if first_byte == 123 then -- '{'
+                local ok, msg = pcall(textutils.unserialize, message)
+                if ok and msg and msg.group == group_name then
+                    if msg.type == "hello" then
+                        if not slaves[sender_id] then
+                            slaves[sender_id] = {id = sender_id}
+                            log("Slave connected: ID " .. sender_id)
+                        end
                         slaves[sender_id].last_seen = os.clock()
                         slaves[sender_id].alive = true
-                        slaves[sender_id].status = msg.state
-                        if msg.track then slaves[sender_id].track = msg.track end
+                        slaves[sender_id].name = msg.name or ("Slave " .. sender_id)
+                        if not slaves[sender_id].status then
+                            slaves[sender_id].status = "connected"
+                        end
+                        sendTo(sender_id, {cmd = "welcome"})
                         scheduleRedraw()
-                    end
 
-                elseif msg.type == "ready" then
-                    if slaves[sender_id] then
-                        slaves[sender_id].status = "ready"
-                        slaves[sender_id].last_seen = os.clock()
-                        log("Ready: " .. sender_id)
-                        scheduleRedraw()
-                    end
+                    elseif msg.type == "heartbeat" then
+                        if slaves[sender_id] then
+                            slaves[sender_id].last_seen = os.clock()
+                            slaves[sender_id].alive = true
+                            slaves[sender_id].status = msg.state
+                            if msg.track then slaves[sender_id].track = msg.track end
+                            scheduleRedraw()
+                        end
 
-                elseif msg.type == "pong" then
-                    if slaves[sender_id] then
-                        rtt_pong_by_id[sender_id] = msg.seq or 0
-                    end
+                    elseif msg.type == "ready" then
+                        if slaves[sender_id] then
+                            slaves[sender_id].status = "ready"
+                            slaves[sender_id].last_seen = os.clock()
+                            log("Ready: " .. sender_id)
+                            scheduleRedraw()
+                        end
 
-                elseif msg.type == "track_end" then
-                    if slaves[sender_id] then
-                        slaves[sender_id].status = "idle"
-                        slaves[sender_id].track = nil
-                        slaves[sender_id].last_seen = os.clock()
-                        log("End: " .. sender_id)
-                        scheduleRedraw()
-                    end
+                    elseif msg.type == "pong" then
+                        if slaves[sender_id] then
+                            rtt_pong_by_id[sender_id] = msg.seq or 0
+                        end
 
-                elseif msg.type == "play_started" then
-                    if slaves[sender_id] then
-                        slaves[sender_id].status = "playing"
-                        slaves[sender_id].track = msg.track
-                        slaves[sender_id].last_seen = os.clock()
-                        log("Playing: " .. sender_id)
-                        scheduleRedraw()
-                    end
+                    elseif msg.type == "track_end" then
+                        if slaves[sender_id] then
+                            slaves[sender_id].status = "idle"
+                            slaves[sender_id].track = nil
+                            slaves[sender_id].last_seen = os.clock()
+                            log("End: " .. sender_id)
+                            scheduleRedraw()
+                        end
 
-                elseif msg.type == "play_stopped" then
-                    if slaves[sender_id] then
-                        slaves[sender_id].status = "idle"
-                        slaves[sender_id].track = nil
-                        slaves[sender_id].last_seen = os.clock()
-                        log("Stopped: " .. sender_id)
-                        scheduleRedraw()
+                    elseif msg.type == "play_started" then
+                        if slaves[sender_id] then
+                            slaves[sender_id].status = "playing"
+                            slaves[sender_id].track = msg.track
+                            slaves[sender_id].last_seen = os.clock()
+                            log("Playing: " .. sender_id)
+                            scheduleRedraw()
+                        end
+
+                    elseif msg.type == "play_stopped" then
+                        if slaves[sender_id] then
+                            slaves[sender_id].status = "idle"
+                            slaves[sender_id].track = nil
+                            slaves[sender_id].last_seen = os.clock()
+                            log("Stopped: " .. sender_id)
+                            scheduleRedraw()
+                        end
                     end
                 end
             end
+            -- Audio data (non-protocol) is ignored by master
         end
     end
 end
@@ -685,7 +797,8 @@ local function mouseLoop()
                         playing = false
                         broadcastCommand({cmd = "stop"})
                         log("Stopped by user")
-                    elseif is_loading then
+                    elseif downloading or is_loading then
+                        downloading = false
                         is_loading = false
                         is_error = false
                         sync_request = nil
@@ -703,6 +816,7 @@ local function mouseLoop()
                     broadcastCommand({cmd = "stop"})
                     playing = false
                     is_loading = false
+                    downloading = false
                     if #queue > 0 then
                         now_playing = queue[1]
                         table.remove(queue, 1)
@@ -716,7 +830,7 @@ local function mouseLoop()
                     scheduleRedraw()
                 end
             elseif y == 8 and x >= 2 and x < 12 then
-                if now_playing and not is_loading then
+                if now_playing and not is_loading and not downloading then
                     sync_request = now_playing
                     log("Sync: " .. (now_playing.name or ""))
                 end

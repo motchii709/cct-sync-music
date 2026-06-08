@@ -1,46 +1,55 @@
 --[[
-  Theme Park Music System - Slave v3
-  Normal Computer専用 (黒白表示)
-  
-  Masterからのコマンドを受信し、音声を再生する。
-  rednet (Wireless Modem) で通信。
-  
-  使い方:
-    1. Wireless ModemをComputerに取り付ける
-    2. SpeakerをComputerに接続する
-    3. wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua slave
-    4. slave で起動
-  更新方法:
-    1. wget https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua slave
-    2. slave で再起動
+  Theme Park Music System - Slave v3 (Audio Relay)
+  Normal Computer (monochrome, no mouse)
+
+  Receives raw DFPWM audio from master via rednet and plays through speakers.
+  No local cache, no HTTP — master handles all downloading.
+
+  Setup:
+    1. Attach Wireless Modem + Speaker(s) to computer
+    2. Place .slave_config file with two lines: group_name, computer_name
+    3. Run: slave
 ]]
 
 ------------------------------------------------------------
 -- Constants
 ------------------------------------------------------------
-local API_BASE_URL = "https://ipod-2to6magyna-uc.a.run.app/"
-local VERSION = "2.1"
-local PROTOCOL = "park_music_v3"
-local CACHE_DIR = "cache"
-local CONFIG_FILE = ".slave_config"
+local PROTOCOL       = "park_music_v3"
+local CONFIG_FILE    = ".slave_config"
 local HELLO_INTERVAL = 3
-local DL_TIMEOUT = 60
 local MASTER_TIMEOUT = 30
+local UI_REFRESH     = 0.5
+local LOG_MAX        = 20
 
 ------------------------------------------------------------
--- Initialization
+-- Terminal helpers
 ------------------------------------------------------------
 local width, height = term.getSize()
 
 local function trunc(str)
     if not str then return "" end
-    if #str > width then return string.sub(str, 1, width - 3) .. "..." end
+    str = tostring(str)
+    if #str > width then
+        if width > 3 then
+            return str:sub(1, width - 3) .. "..."
+        end
+        return str:sub(1, width)
+    end
     return str
 end
 
--- Config
-local group_name = nil
+local function pad(str, n)
+    str = tostring(str)
+    if #str >= n then return str:sub(1, n) end
+    return str .. string.rep(" ", n - #str)
+end
+
+------------------------------------------------------------
+-- Config (line-based, backward compatible)
+------------------------------------------------------------
+local group_name    = nil
 local computer_name = nil
+
 do
     local f = fs.open(CONFIG_FILE, "r")
     if f then
@@ -51,19 +60,20 @@ do
         if c and #c > 0 then computer_name = c end
     end
 end
+
 if not group_name or not computer_name then
-    term.setBackgroundColor(colors.black)
-    term.setTextColor(colors.white)
     term.clear()
     term.setCursorPos(1, 1)
-    print("=== Theme Park Music - Slave ===")
+    print("=== Park Music - Slave Setup ===")
     print("")
     if not group_name then
         print("Group name:")
         term.setCursorPos(1, 4)
         term.clearLine()
         group_name = read()
-        if not group_name or #group_name == 0 then error("Group name required.", 0) end
+        if not group_name or #group_name == 0 then
+            error("Group name required.", 0)
+        end
     end
     if not computer_name then
         print("")
@@ -71,7 +81,9 @@ if not group_name or not computer_name then
         term.setCursorPos(1, 7)
         term.clearLine()
         computer_name = read()
-        if not computer_name or #computer_name == 0 then computer_name = "Slave" end
+        if not computer_name or #computer_name == 0 then
+            computer_name = "Slave"
+        end
     end
     local wf = fs.open(CONFIG_FILE, "w")
     if wf then
@@ -81,40 +93,42 @@ if not group_name or not computer_name then
     end
 end
 
--- Cache dir
-if not fs.exists(CACHE_DIR) then fs.makeDir(CACHE_DIR) end
-
+------------------------------------------------------------
 -- Speakers
+------------------------------------------------------------
 local speakers = { peripheral.find("speaker") }
 if #speakers == 0 then
     error("No speakers attached.", 0)
 end
 
 ------------------------------------------------------------
+-- Audio decoder
+------------------------------------------------------------
+local decoder = require("cc.audio.dfpwm").make_decoder()
+
+------------------------------------------------------------
 -- State
 ------------------------------------------------------------
 local state = {
-    connected = false,
-    masterId = nil,
-    status = "IDLE",
-    track = nil,
-    volume = 1.0,
-    playback_stop = false,
+    connected      = false,
+    masterId       = nil,
+    status         = "IDLE",   -- IDLE | CONNECTED | WAITING | PLAYING | ERROR
+    track          = nil,
+    volume         = 1.0,
+    playback_stop  = false,
     lastMasterTime = os.clock(),
-    lastHello = 0,
+    lastHello      = 0,
+    play_at_time   = nil,
 }
 
-local pending_play = nil
-
+------------------------------------------------------------
 -- Log
+------------------------------------------------------------
 local log_lines = {}
-local LOG_MAX = 20
 
-------------------------------------------------------------
--- Utilities
-------------------------------------------------------------
 local function logMsg(msg)
-    local entry = string.format("[%s] %s", textutils.formatTime(os.time(), true), msg)
+    local entry = string.format("[%s] %s",
+        textutils.formatTime(os.time(), true), msg)
     table.insert(log_lines, entry)
     if #log_lines > LOG_MAX then
         table.remove(log_lines, 1)
@@ -125,390 +139,199 @@ end
 -- UI
 ------------------------------------------------------------
 local function uiUpdate()
-    term.setBackgroundColor(colors.black)
     term.clear()
 
-    term.setTextColor(colors.white)
+    -- Header bar (inverse via spaces)
     term.setCursorPos(1, 1)
-    term.setBackgroundColor(colors.gray)
-    term.clearLine()
-    term.setCursorPos(2, 1)
-    term.write(trunc("=== " .. (computer_name or "Slave") .. " ==="))
+    term.write(trunc(" " .. computer_name .. " " ..
+        string.rep("=", math.max(0, width - #computer_name - 3))))
 
-    local yi = 3
-    term.setBackgroundColor(colors.black)
+    local y = 3
+    local function row(label, value)
+        if y > height then return end
+        term.setCursorPos(2, y)
+        term.write(pad(label .. ":", 9) .. tostring(value))
+        y = y + 1
+    end
 
-    term.setCursorPos(2, yi)
-    term.setTextColor(colors.lightGray)
-    term.write("Group:   ")
-    term.setTextColor(colors.white)
-    term.write(group_name)
-    yi = yi + 1
-
-    term.setCursorPos(2, yi)
-    term.setTextColor(colors.lightGray)
-    term.write("Status:  ")
-    local st = state.status
-    if st == "PLAYING" then term.setTextColor(colors.lime)
-    elseif st == "ERROR" then term.setTextColor(colors.red)
-    elseif st == "DOWNLOADING" then term.setTextColor(colors.yellow)
-    elseif st == "CONNECTED" or st == "READY" then term.setTextColor(colors.green)
-    else term.setTextColor(colors.lightGray) end
-    term.write(st)
-    yi = yi + 1
-
-    term.setCursorPos(2, yi)
-    term.setTextColor(colors.lightGray)
-    term.write("Track:   ")
-    term.setTextColor(colors.white)
+    row("Group",    group_name)
+    row("Status",   state.status)
     if state.track then
         local tname = state.track.name or state.track.id or "unknown"
-        term.write(trunc(tname))
+        row("Track", tname)
     else
-        term.write("(none)")
+        row("Track", "-")
     end
-    yi = yi + 1
-
-    term.setCursorPos(2, yi)
-    term.setTextColor(colors.lightGray)
-    term.write("Volume:  ")
-    term.setTextColor(colors.white)
-    term.write(math.floor(state.volume * 100) .. "%")
-    yi = yi + 1
-
-    term.setCursorPos(2, yi)
-    term.setTextColor(colors.lightGray)
-    term.write("Speakers: ")
-    term.setTextColor(colors.white)
-    term.write(#speakers)
-    yi = yi + 1
-
-    term.setCursorPos(2, yi)
-    term.setTextColor(colors.lightGray)
-    term.write("Master:  ")
+    row("Volume",   string.format("%.0f%%", state.volume * 100))
+    row("Speakers", tostring(#speakers))
     if state.masterId then
-        term.setTextColor(colors.green)
-        term.write("ID " .. state.masterId)
+        row("Master", "ID " .. state.masterId)
     else
-        term.setTextColor(colors.lightGray)
-        term.write("Waiting...")
+        row("Master", "waiting...")
     end
-    yi = yi + 2
 
-    -- Log
-    term.setCursorPos(2, yi)
-    term.setTextColor(colors.lightGray)
-    term.write("--- Log ---")
-    yi = yi + 1
+    y = y + 1
+    if y <= height then
+        term.setCursorPos(2, y)
+        term.write(string.rep("-", width - 2))
+        y = y + 1
+    end
 
-    local start = math.max(1, #log_lines - (height - yi - 1))
+    if y <= height then
+        term.setCursorPos(2, y)
+        term.write("Log:")
+        y = y + 1
+    end
+
+    local visible = math.max(0, height - y)
+    local start = math.max(1, #log_lines - visible + 1)
     for i = start, #log_lines do
-        if yi > height then break end
-        term.setCursorPos(2, yi)
-        term.setTextColor(colors.lightGray)
+        if y > height then break end
+        term.setCursorPos(2, y)
         term.write(trunc(log_lines[i]))
-        yi = yi + 1
+        y = y + 1
     end
 end
 
 ------------------------------------------------------------
--- Cache
+-- Protocol helpers
 ------------------------------------------------------------
-local function cachePath(track_id)
-    return CACHE_DIR .. "/" .. track_id .. ".dfpwm"
-end
-
-local function isCached(track_id)
-    return fs.exists(cachePath(track_id))
-end
-
-------------------------------------------------------------
--- Rednet
-------------------------------------------------------------
-local function openRednet()
-    local modem = peripheral.find("modem")
-    if not modem then error("No wireless modem attached.", 0) end
-    rednet.open(peripheral.getName(modem))
-end
-
 local function sendToMaster(msg)
     if not state.masterId then return end
     local out = {}
     for k, v in pairs(msg) do out[k] = v end
-    out.group = group_name
-    out.name = computer_name
+    out.group    = group_name
+    out.computer = computer_name
     rednet.send(state.masterId, textutils.serialize(out), PROTOCOL)
 end
 
-local function broadcastToMaster(msg)
+local function broadcast(msg)
     local out = {}
     for k, v in pairs(msg) do out[k] = v end
-    out.group = group_name
-    out.name = computer_name
+    out.group    = group_name
+    out.computer = computer_name
     rednet.broadcast(textutils.serialize(out), PROTOCOL)
 end
 
 ------------------------------------------------------------
--- Download (cache to disk)
+-- playChunk: decode and play one DFPWM chunk
 ------------------------------------------------------------
-local function downloadTrack(track)
-    local track_id = track.id
-    if isCached(track_id) then return true end
+local function playChunk(data)
+    local ok, decoded = pcall(decoder, data)
+    if not ok or not decoded or #decoded == 0 then return end
 
-    -- Delete old cache to free space
-    if fs.exists(CACHE_DIR) then
-        local files = fs.list(CACHE_DIR)
-        for _, f in ipairs(files) do
-            pcall(fs.delete, CACHE_DIR .. "/" .. f)
-        end
-    end
-
-    local free = fs.getFreeSpace(CACHE_DIR)
-    logMsg("DL: " .. (track.name or track_id))
-    logMsg("Free: " .. free .. "B")
-    state.status = "DOWNLOADING"
-    state.track = track
-    uiUpdate()
-
-    local url = API_BASE_URL .. "?v=" .. VERSION .. "&id=" .. textutils.urlEncode(track_id)
-    http.request({url = url, binary = true})
-
-    local timer = os.startTimer(DL_TIMEOUT)
-    while true do
-        local ev, p1, p2 = os.pullEvent()
-        if ev == "http_success" and p1 == url then
-            local data = p2.readAll()
-            p2.close()
-            os.cancelTimer(timer)
-
-            if not data or #data == 0 then
-                logMsg("DL empty response")
-                state.status = "ERROR"
-                uiUpdate()
-                return false
-            end
-
-            if #data > free then
-                logMsg("NO SPACE: need " .. #data .. "B, free " .. free .. "B")
-                logMsg("Use Advanced Computer or shorter song")
-                state.status = "ERROR"
-                uiUpdate()
-                return false
-            end
-
-            local wf = fs.open(cachePath(track_id), "wb")
-            if not wf then
-                logMsg("Cannot write file")
-                state.status = "ERROR"
-                uiUpdate()
-                return false
-            end
-            wf.write(data)
-            wf.close()
-
-            logMsg("Cached: " .. #data .. " bytes")
-            state.status = "READY"
-            uiUpdate()
-            return true
-
-        elseif ev == "http_failure" and p1 == url then
-            os.cancelTimer(timer)
-            logMsg("DL failed")
-            state.status = "ERROR"
-            uiUpdate()
-            return false
-        elseif ev == "timer" and p1 == timer then
-            logMsg("DL timeout")
-            state.status = "ERROR"
-            uiUpdate()
-            return false
-        end
-    end
-end
-
-------------------------------------------------------------
--- Audio playback (from cache)
-------------------------------------------------------------
-local function playFromCache(track, delay)
-    local track_id = track.id
-    local path = cachePath(track_id)
-    if not fs.exists(path) then
-        logMsg("Cache miss: " .. track_id)
-        sendToMaster({type = "track_end"})
-        return
-    end
-
-    -- Wait for delay
-    if delay and delay > 0 then
-        state.status = "WAITING"
-        uiUpdate()
-        local start_time = os.clock() + delay
-        while not state.playback_stop and os.clock() < start_time do
-            sleep(0.05)
-        end
-    end
-
-    if state.playback_stop then
-        state.status = "READY"
-        uiUpdate()
-        return
-    end
-
-    logMsg("Playing: " .. (track.name or track_id))
-    state.status = "PLAYING"
-    state.playback_stop = false
-    uiUpdate()
-    sendToMaster({type = "play_started", track = track})
-
-    local decoder = require("cc.audio.dfpwm").make_decoder()
-    local f = fs.open(path, "rb")
-    if not f then
-        logMsg("Cannot open cache")
-        state.status = "ERROR"
-        uiUpdate()
-        sendToMaster({type = "track_end"})
-        return
-    end
-
-    local ok, err = pcall(function()
-        local chunk_size = 16 * 1024
-        while not state.playback_stop do
-            local chunk = f.read(chunk_size)
-            if not chunk then break end
-
-            local decoded = decoder(chunk)
-            if decoded and #decoded > 0 then
-                for _, sp in ipairs(speakers) do
-                    pcall(sp.playAudio, decoded, state.volume)
-                end
-                while not state.playback_stop do
-                    local any_busy = false
-                    for _, sp in ipairs(speakers) do
-                        local s_ok, level = pcall(sp.getAudioLevel)
-                        if s_ok and level > 0 then
-                            any_busy = true
-                            break
-                        end
-                    end
-                    if not any_busy then break end
-                    os.pullEvent("speaker_audio_empty")
-                end
-            end
-        end
-    end)
-
-    f.close()
     for _, sp in ipairs(speakers) do
-        pcall(sp.stop)
+        pcall(sp.playAudio, decoded, state.volume)
     end
 
-    if not ok then
-        logMsg("Error: " .. tostring(err))
-    end
-
-    if not state.playback_stop then
-        state.status = "READY"
-    end
-    state.track = nil
-    uiUpdate()
-    logMsg("Track ended")
-    sendToMaster({type = "track_end"})
-end
-
-------------------------------------------------------------
--- Audio loop
-------------------------------------------------------------
-local function audioLoop()
-    while true do
-        if pending_play then
-            local task = pending_play
-            pending_play = nil
-            playFromCache(task.track, task.delay)
-        else
-            sleep(0.1)
-        end
-    end
-end
-
-------------------------------------------------------------
--- Rednet receive
-------------------------------------------------------------
-local function rednetLoop()
-    while true do
-        local sender_id, message, protocol = rednet.receive(PROTOCOL)
-        if sender_id and message then
-            local ok, cmd = pcall(textutils.unserialize, message)
-            if ok and cmd and cmd.group == group_name then
-                state.lastMasterTime = os.clock()
-
-                if cmd.cmd == "welcome" then
-                    state.connected = true
-                    state.masterId = sender_id
-                    state.status = "READY"
-                    logMsg("Connected: " .. sender_id)
-                    uiUpdate()
-
-                elseif cmd.cmd == "download" and cmd.track then
-                    state.masterId = sender_id
-                    local dl_ok = downloadTrack(cmd.track)
-                    if dl_ok then
-                        sendToMaster({type = "ready", track_id = cmd.track.id})
-                    else
-                        sendToMaster({type = "track_end"})
-                    end
-
-                elseif cmd.cmd == "ping" then
-                    state.masterId = sender_id
-                    sendToMaster({type = "pong", seq = cmd.seq})
-
-                elseif cmd.cmd == "play_at" and cmd.track then
-                    state.masterId = sender_id
-                    if cmd.volume then state.volume = cmd.volume end
-                    pending_play = {track = cmd.track, delay = cmd.delay or 0}
-
-                elseif cmd.cmd == "stop" then
-                    state.masterId = sender_id
-                    state.playback_stop = true
-                    pending_play = nil
-                    for _, sp in ipairs(speakers) do
-                        pcall(sp.stop)
-                    end
-                    state.track = nil
-                    state.status = "READY"
-                    uiUpdate()
-                    sendToMaster({type = "play_stopped"})
-                    logMsg("Stopped")
-
-                elseif cmd.cmd == "volume" and cmd.level then
-                    state.volume = math.max(0, math.min(3, cmd.level))
-                    uiUpdate()
-
-                elseif cmd.cmd == "heartbeat" then
-                    state.masterId = sender_id
-                    sendToMaster({type = "heartbeat", state = state.status, track = state.track})
-                end
+    while not state.playback_stop do
+        local any_busy = false
+        for _, sp in ipairs(speakers) do
+            local s_ok, level = pcall(sp.getAudioLevel)
+            if s_ok and level > 0 then
+                any_busy = true
+                break
             end
         end
+        if not any_busy then break end
+        os.pullEvent("speaker_audio_empty")
     end
 end
 
 ------------------------------------------------------------
--- Connect loop
+-- Command handler
+------------------------------------------------------------
+local function handleCommand(sender_id, cmd)
+    if not cmd or not cmd.cmd then return end
+    state.lastMasterTime = os.clock()
+
+    local c = cmd.cmd
+
+    if c == "welcome" then
+        state.connected = true
+        state.masterId  = sender_id
+        state.status    = "CONNECTED"
+        logMsg("Connected to master " .. sender_id)
+
+    elseif c == "download" then
+        sendToMaster({type = "ready"})
+        logMsg("Download-ready sent")
+
+    elseif c == "ping" then
+        sendToMaster({type = "pong", seq = cmd.seq})
+
+    elseif c == "play_at" then
+        if cmd.volume then
+            state.volume = math.max(0, math.min(3, cmd.volume))
+        end
+        state.status         = "WAITING"
+        state.track          = cmd.track
+        state.playback_stop  = false
+        if cmd.delay and cmd.delay > 0 then
+            state.play_at_time = os.clock() + cmd.delay
+            logMsg("Scheduled in " .. string.format("%.1fs", cmd.delay) ..
+                   ": " .. (cmd.track and cmd.track.name or "?"))
+        else
+            state.play_at_time = nil
+            state.status = "PLAYING"
+            logMsg("Playing now: " .. (cmd.track and cmd.track.name or "?"))
+        end
+
+    elseif c == "stop" then
+        state.playback_stop = true
+        state.status    = state.connected and "CONNECTED" or "IDLE"
+        state.track     = nil
+        state.play_at_time = nil
+        for _, sp in ipairs(speakers) do
+            pcall(sp.stop)
+        end
+        sendToMaster({type = "track_end"})
+        logMsg("Stopped")
+
+    elseif c == "volume" then
+        state.volume = math.max(0, math.min(3, cmd.level or 1.0))
+        logMsg("Volume " .. string.format("%.0f%%", state.volume * 100))
+
+    elseif c == "heartbeat" then
+        sendToMaster({
+            type  = "heartbeat",
+            state = state.status,
+            track = state.track,
+        })
+
+    elseif c == "audio_end" then
+        state.playback_stop = true
+        state.status    = state.connected and "CONNECTED" or "IDLE"
+        state.track     = nil
+        state.play_at_time = nil
+        for _, sp in ipairs(speakers) do
+            pcall(sp.stop)
+        end
+        sendToMaster({type = "track_end"})
+        logMsg("Track ended")
+    end
+end
+
+------------------------------------------------------------
+-- Connect loop: send hello, detect master loss
 ------------------------------------------------------------
 local function connectLoop()
     while true do
         if not state.connected then
             if os.clock() - state.lastHello >= HELLO_INTERVAL then
-                broadcastToMaster({type = "hello"})
+                broadcast({type = "hello"})
                 state.lastHello = os.clock()
+                logMsg("Hello broadcast")
             end
         else
             if os.clock() - state.lastMasterTime > MASTER_TIMEOUT then
-                state.connected = false
-                state.masterId = nil
-                state.status = "IDLE"
+                state.connected      = false
+                state.masterId       = nil
+                state.status         = "IDLE"
+                state.track          = nil
+                state.playback_stop  = true
+                state.play_at_time   = nil
                 logMsg("Master lost, reconnecting...")
-                uiUpdate()
             end
         end
         sleep(1)
@@ -516,12 +339,57 @@ local function connectLoop()
 end
 
 ------------------------------------------------------------
+-- Rednet loop: protocol messages + raw audio chunks
+------------------------------------------------------------
+local function rednetLoop()
+    while true do
+        local sender_id, message, proto = rednet.receive(PROTOCOL)
+        if sender_id and message then
+            if type(message) == "string" and #message > 0 and message:sub(1, 1) == "{" then
+                -- Protocol message
+                local ok, cmd = pcall(textutils.unserialize, message)
+                if ok and type(cmd) == "table" and cmd.group == group_name then
+                    handleCommand(sender_id, cmd)
+                end
+            elseif type(message) == "string" and #message > 0 then
+                -- Raw DFPWM audio chunk
+                if state.status == "PLAYING" then
+                    playChunk(message)
+                end
+            end
+        end
+    end
+end
+
+------------------------------------------------------------
+-- Audio loop: play_at scheduling + UI refresh
+------------------------------------------------------------
+local function audioLoop()
+    while true do
+        if state.status == "WAITING" and state.play_at_time then
+            if os.clock() >= state.play_at_time then
+                state.status       = "PLAYING"
+                state.play_at_time = nil
+                logMsg("Playback started")
+            end
+        end
+        uiUpdate()
+        sleep(UI_REFRESH)
+    end
+end
+
+------------------------------------------------------------
 -- Main
 ------------------------------------------------------------
-openRednet()
-uiUpdate()
+local modem = peripheral.find("modem")
+if not modem then
+    error("No wireless modem attached.", 0)
+end
+rednet.open(peripheral.getName(modem))
+
 logMsg("Group: " .. group_name)
+logMsg("Speakers: " .. #speakers)
 logMsg("Waiting for master...")
-broadcastToMaster({type = "hello"})
+broadcast({type = "hello"})
 
 parallel.waitForAny(connectLoop, rednetLoop, audioLoop)
