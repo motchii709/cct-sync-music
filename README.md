@@ -2,6 +2,7 @@
 
 テーマパークで使われてるような音楽同期システム。
 複数のComputerに繋いだSpeakerで、同じ曲をズレずに同時再生する。
+シングルプレイでもサーバーでも使える。
 
 ## 必要なもの
 
@@ -19,25 +20,31 @@
 
 SpeakerはComputerの横に直接置いてOK。Wireless Modemも右クリックで取り付けるだけ。
 
-## 使い方
+## セットアップ
 
-### 1. Masterセットアップ
+### 1. Master
 
-Advanced Computerに `master.lua` を入れて `master` を実行。
+Advanced Computerを右クリックして開く。
 
 ```
-master.lua をAdvanced Computerにドラッグ&ドロップ
-> master
+wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua
 ```
 
-### 2. Slaveセットアップ
+`master` と打って実行。
 
-各Normal Computerに `slave.lua` を入れて `slave` を実行。
+### 2. Slave
+
+各Normal Computerを右クリックして開く。
+
+```
+wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua
+```
+
+`slave` と打って実行。
 
 初回起動時にゾーン名を聞かれる。入力すると `.slave_config` に保存されるから、再起動しても毎回入力しなくていい。
 
 ```
-> slave
 Zone name: 入口
 ```
 
@@ -52,6 +59,11 @@ Masterの画面で「Playlist」タブをクリック → YouTubeのURL貼るか
 「Now Playing」タブ → 「Sync All」ボタン。
 
 これで全Slaveに同期コマンドが飛んで、同時に再生開始する。
+
+### サーバーで使う場合
+
+特に追加の設定はいらない。Modが入ったサーバーにAdvanced ComputerとNormal Computerを置いて、上と同じ手順で動かせばOK。
+Wireless Modemの通信範囲内で、他のプレイヤーの干渉がない限りは問題なく動く。
 
 ## 同期の仕組み
 
