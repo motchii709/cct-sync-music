@@ -735,7 +735,7 @@ local function mouseLoop()
                     term.setCursorPos(3, 4)
                     term.setBackgroundColor(colors.white)
                     term.setTextColor(colors.black)
-                    local input = read(nil, nil, search_query)
+                    local input = read(nil, nil, function() return search_query end)
                     search_input_mode = false
                     if #input > 0 then
                         search_query = input
