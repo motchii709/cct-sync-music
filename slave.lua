@@ -286,17 +286,18 @@ end
 ------------------------------------------------------------
 -- Stream play (reads from HTTP handle, no disk)
 ------------------------------------------------------------
-local function playStream(track, start_time)
+local function playStream(track, delay)
     if not stream_handle then
         logMsg("No stream: " .. (track.id or ""))
         sendToMaster({type = "track_end"})
         return
     end
 
-    -- Wait for start_time
-    if start_time then
+    -- Wait for delay
+    if delay and delay > 0 then
         state.status = "WAITING"
         uiUpdate()
+        local start_time = os.clock() + delay
         while not state.playback_stop and os.clock() < start_time do
             sleep(0.05)
         end
@@ -375,7 +376,7 @@ local function audioLoop()
         if pending_play then
             local task = pending_play
             pending_play = nil
-            playStream(task.track, task.start_time)
+            playStream(task.track, task.delay)
         else
             sleep(0.1)
         end
@@ -411,7 +412,7 @@ local function rednetLoop()
                 elseif cmd.cmd == "play_at" and cmd.track then
                     state.masterId = sender_id
                     if cmd.volume then state.volume = cmd.volume end
-                    pending_play = {track = cmd.track, start_time = cmd.start_time}
+                    pending_play = {track = cmd.track, delay = cmd.delay or 0}
 
                 elseif cmd.cmd == "stop" then
                     state.masterId = sender_id

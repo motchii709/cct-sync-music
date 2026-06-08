@@ -456,12 +456,12 @@ local function syncLoop()
                 end
 
                 -- Send play_at
-                local start_time = os.clock() + max_offset + SYNC_LEAD_TIME
-                log("Play at: " .. string.format("+%.1fs", max_offset + SYNC_LEAD_TIME))
+                local delay = max_offset + SYNC_LEAD_TIME
+                log("Play at: " .. string.format("+%.1fs", delay))
                 broadcastCommand({
                     cmd = "play_at",
                     track = {id = track.id, name = track.name, artist = track.artist},
-                    start_time = start_time,
+                    delay = delay,
                     volume = volume
                 })
 
@@ -735,7 +735,6 @@ local function mouseLoop()
                     term.setCursorPos(3, 4)
                     term.setBackgroundColor(colors.white)
                     term.setTextColor(colors.black)
-                    print(search_query)
                     local input = read()
                     search_input_mode = false
                     if #input > 0 then
