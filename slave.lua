@@ -293,6 +293,8 @@ local function playStream(track, delay)
         return
     end
 
+    logMsg("Delay: " .. tostring(delay) .. "s")
+
     -- Wait for delay
     if delay and delay > 0 then
         state.status = "WAITING"
@@ -304,6 +306,7 @@ local function playStream(track, delay)
     end
 
     if state.playback_stop then
+        logMsg("Stopped before play")
         pcall(function() stream_handle.close() end)
         stream_handle = nil
         return
@@ -412,6 +415,7 @@ local function rednetLoop()
                 elseif cmd.cmd == "play_at" and cmd.track then
                     state.masterId = sender_id
                     if cmd.volume then state.volume = cmd.volume end
+                    logMsg("play_at delay=" .. tostring(cmd.delay))
                     pending_play = {track = cmd.track, delay = cmd.delay or 0}
 
                 elseif cmd.cmd == "stop" then
