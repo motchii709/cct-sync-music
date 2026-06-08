@@ -61,12 +61,6 @@ local playing_id = nil
 local last_download_url = nil
 local is_loading = false
 local is_error = false
-local decoder = require("cc.audio.dfpwm").make_decoder()
-
-local speakers = { peripheral.find("speaker") }
-if #speakers == 0 then
-    error("No speakers attached.", 0)
-end
 
 -- 同期制御
 local sync_request = nil    -- {track=...} 同期再生リクエスト
@@ -417,147 +411,10 @@ local playback_stop = false
 local function stopLocalPlayback()
     playing = false
     playback_stop = true
-    for _, speaker in ipairs(speakers) do
-        speaker.stop()
-    end
-end
-
--- 再生コルーチン: 再生キューから1曲取り出して再生
-local playback_task = nil  -- {track=...}
-
-local function audioLoop()
-    while true do
-        if playback_task then
-            local track = playback_task
-            playback_task = nil
-
-            if isCached(track.id) then
-                -- キャッシュから再生
-                playing = true
-                playback_stop = false
-                playing_id = track.id
-                is_loading = false
-                is_error = false
-                redrawScreen()
-
-                local f = fs.open(cachePath(track.id), "rb")
-                local chunk_size = 16 * 1024
-                local first = f.read(4)
-                local read_size = chunk_size - 4
-
-                while playing and not playback_stop do
-                    local chunk = f.read(read_size)
-                    if not chunk then break end
-
-                    local decoded
-                    if first then
-                        decoded = decoder(first .. chunk)
-                        first = nil
-                        read_size = chunk_size
-                    else
-                        decoded = decoder(chunk)
-                    end
-
-                    local fn = {}
-                    for i, speaker in ipairs(speakers) do
-                        fn[i] = function()
-                            local name = peripheral.getName(speaker)
-                            while not speaker.playAudio(decoded, volume) do
-                                parallel.waitForAny(
-                                    function()
-                                        repeat until select(2, os.pullEvent("speaker_audio_empty")) == name
-                                    end,
-                                    function()
-                                        local ev = os.pullEvent()
-                                        if ev == "playback_stopped" then return end
-                                    end
-                                )
-                                if playback_stop then return end
-                            end
-                        end
-                    end
-                    pcall(parallel.waitForAll, table.unpack(fn))
-                    if playback_stop then break end
-                end
-                f.close()
-
-            else
-                -- Firebaseからストリーミング
-                local url = API_BASE_URL .. "?v=" .. VERSION .. "&id=" .. textutils.urlEncode(track.id)
-                is_loading = true
-                playing_id = track.id
-                redrawScreen()
-                http.request({url = url, binary = true})
-
-                -- http_success を待つ
-                while true do
-                    local ev, p1, p2 = os.pullEvent()
-                    if ev == "http_success" and p1 == url then
-                        is_loading = false
-                        redrawScreen()
-                        playing = true
-                        playback_stop = false
-
-                        local handle = p2
-                        local first = handle.read(4)
-                        local read_size = 16 * 1024 - 4
-
-                        while playing and not playback_stop do
-                            local chunk = handle.read(read_size)
-                            if not chunk then break end
-
-                            local decoded
-                            if first then
-                                decoded = decoder(first .. chunk)
-                                first = nil
-                                read_size = read_size + 4
-                            else
-                                decoded = decoder(chunk)
-                            end
-
-                            local fn = {}
-                            for i, speaker in ipairs(speakers) do
-                                fn[i] = function()
-                                    local name = peripheral.getName(speaker)
-                                    while not speaker.playAudio(decoded, volume) do
-                                        parallel.waitForAny(
-                                            function()
-                                                repeat until select(2, os.pullEvent("speaker_audio_empty")) == name
-                                            end,
-                                            function()
-                                                local ev2 = os.pullEvent()
-                                                if ev2 == "playback_stopped" then return end
-                                            end
-                                        )
-                                        if playback_stop then return end
-                                    end
-                                end
-                            end
-                            pcall(parallel.waitForAll, table.unpack(fn))
-                            if playback_stop then break end
-                        end
-                        handle.close()
-                        break
-                    elseif ev == "http_failure" and p1 == url then
-                        is_loading = false
-                        is_error = true
-                        redrawScreen()
-                        break
-                    end
-                end
-            end
-
-            playing = false
-            is_loading = false
-            redrawScreen()
-        else
-            sleep(0.1)
-        end
-    end
 end
 
 ------------------------------------------------------------
--- 同期再生 (全Slave + Master)
+-- 同期再生 (全Slave)
 -- 
 -- syncLoop がバックグラウンドで実行する。
 -- mouseLoop はリクエストをキューイングして即座に返る。
@@ -577,8 +434,7 @@ local function syncLoop()
             redrawScreen()
 
             if slave_count == 0 then
-                -- Master単独再生
-                playback_task = {track = track}
+                -- Slaveなし: キューだけ更新
                 is_loading = false
                 redrawScreen()
             else
@@ -587,12 +443,6 @@ local function syncLoop()
                     cmd = "download",
                     track = {id = track.id, name = track.name, artist = track.artist}
                 })
-                -- MasterもDL
-                if not isCached(track.id) then
-                    local url = API_BASE_URL .. "?v=" .. VERSION .. "&id=" .. textutils.urlEncode(track.id)
-                    last_download_url = url
-                    http.request({url = url, binary = true})
-                end
 
                 -- Phase 1待機 (タイムアウト30秒)
                 local timeout = os.startTimer(30)
@@ -600,11 +450,6 @@ local function syncLoop()
                 while ready_count < slave_count do
                     local ev, p1 = os.pullEvent()
                     if ev == "timer" and p1 == timeout then break end
-                    -- rednetLoop が ready を処理して ready_count を増やす
-                    -- ただし、rednetLoop は別ループなのでここでは待機するだけ
-                    -- → 実際には rednetLoop が zones に反映し、
-                    --   ここで ready_count を直接読む代わりに
-                    --   zones のカウントで判定
                     ready_count = 0
                     for _, info in pairs(zones) do
                         if info.status then ready_count = ready_count + 1 end
@@ -648,8 +493,6 @@ local function syncLoop()
                     volume = volume
                 })
 
-                -- Masterも同時刻に再生開始
-                playback_task = {track = track}
                 is_loading = false
                 redrawScreen()
             end
@@ -968,6 +811,5 @@ parallel.waitForAny(
     schedulerLoop,
     mouseLoop,
     dragLoop,
-    audioLoop,
     syncLoop
 )

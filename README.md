@@ -15,7 +15,7 @@
 |---|---|
 | Advanced Computer | Master用 (1台) |
 | Normal Computer | Slave用 (各ゾーンに1台) |
-| Speaker | 各Computerに最低1個 |
+| Speaker | Slaveに接続 (Masterは不要) |
 | Wireless Modem | 各Computerに1個 |
 
 SpeakerはComputerの横に直接置いてOK。Wireless Modemも右クリックで取り付けるだけ。
