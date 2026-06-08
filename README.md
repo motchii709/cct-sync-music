@@ -30,13 +30,8 @@ Advanced Computerを右クリックして開く。
 wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua
 ```
 
-`master` と打って実行。初回起動時にグループ名を入力する。
-
-```
-Group name: テーマパーク
-```
-
-グループ名は `.master_config` に保存される。
+初回起動時にグループ名を入力。以降は `master` で起動。
+**毎回起動時にGitHubから自動更新される。**
 
 ### 2. Slave
 
@@ -46,15 +41,8 @@ Group name: テーマパーク
 wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/slave.lua
 ```
 
-`slave` と打って実行。初回起動時にグループ名とコンピュータ名を入力する。
-
-```
-Group name: テーマパーク
-Computer name: 入口
-```
-
-設定は `.slave_config` に保存される。2回目以降は自動で読み込まれる。
-**Masterと同じグループ名を入力すると自動接続される。**
+初回起動時にグループ名とコンピュータ名を入力。以降は `slave` で起動。
+**毎回起動時にGitHubから自動更新される。**
 
 ### 3. 曲を選ぶ
 

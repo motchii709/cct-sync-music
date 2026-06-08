@@ -7,12 +7,53 @@
   
   使い方:
     1. Wireless ModemをComputerに取り付ける
-    2. このファイルを実行する
-    3. グループ名を入力 (初回のみ)
-    4. Slaveを起動してrednet接続を待つ
-    5. Playlistタブで曲を検索・追加
-    6. 再生すると全Slaveに同期配信される
+    2. wget run https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua
+    3. 以降は `master` で起動 (自動更新される)
 ]]
+
+------------------------------------------------------------
+-- 自動更新
+------------------------------------------------------------
+local SELF_URL = "https://raw.githubusercontent.com/motchii709/cct-sync-music/master/master.lua"
+local SELF_NAME = "master"
+
+do
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("=== Theme Park Music - Master ===")
+    print("")
+    print("Checking for updates...")
+    local ok, result = pcall(function()
+        http.request(SELF_URL)
+        local timer = os.startTimer(10)
+        while true do
+            local ev, p1, p2 = os.pullEvent()
+            if ev == "http_success" and p1 == SELF_URL then
+                local data = p2.readAll()
+                p2.close()
+                return data
+            elseif ev == "http_failure" and p1 == SELF_URL then
+                return nil
+            elseif ev == "timer" and p1 == timer then
+                return nil
+            end
+        end
+    end)
+    if ok and result then
+        local f = fs.open(SELF_NAME, "w")
+        f.write(result)
+        f.close()
+        print("Updated! Restarting...")
+        sleep(1)
+        shell.run(SELF_NAME)
+        return
+    else
+        print("Using current version.")
+        sleep(0.5)
+    end
+end
 
 ------------------------------------------------------------
 -- 設定
