@@ -43,16 +43,17 @@ do
     end)
     if ok and result then
         local f = fs.open(SELF_NAME, "w")
-        f.write(result)
-        f.close()
-        print("Updated! Restarting...")
-        sleep(1)
-        shell.run(SELF_NAME)
-        return
-    else
-        print("Using current version.")
-        sleep(0.5)
+        if f then
+            f.write(result)
+            f.close()
+            print("Updated! Restarting...")
+            sleep(1)
+            shell.run(SELF_NAME)
+            return
+        end
     end
+    print("Using current version.")
+    sleep(0.5)
 end
 
 ------------------------------------------------------------
@@ -122,7 +123,6 @@ local selected_result = nil
 local result_action_mode = false
 
 -- Slave管理
--- slaves: {id = {id, name, status, track, last_seen, offset, alive}}
 local slaves = {}
 local playing_id = nil
 local is_loading = false
@@ -130,7 +130,7 @@ local is_error = false
 
 -- 同期
 local sync_request = nil
-local rtt_pong_received = false
+local rtt_pong_by_id = {}  -- per-slave pong tracking
 
 -- ログ
 local log_lines = {}
@@ -145,16 +145,6 @@ local function log(msg)
     if #log_lines > LOG_MAX then
         table.remove(log_lines, 1)
     end
-end
-
-local function getAliveSlaves()
-    local alive = {}
-    for id, info in pairs(slaves) do
-        if info.alive then
-            table.insert(alive, id)
-        end
-    end
-    return alive
 end
 
 local function getSlaveCount()
@@ -197,13 +187,17 @@ local function openRednet()
 end
 
 local function broadcastCommand(cmd)
-    cmd.group = group_name
-    rednet.broadcast(textutils.serialize(cmd), PROTOCOL)
+    local out = {}
+    for k, v in pairs(cmd) do out[k] = v end
+    out.group = group_name
+    rednet.broadcast(textutils.serialize(out), PROTOCOL)
 end
 
 local function sendTo(id, cmd)
-    cmd.group = group_name
-    rednet.send(id, textutils.serialize(cmd), PROTOCOL)
+    local out = {}
+    for k, v in pairs(cmd) do out[k] = v end
+    out.group = group_name
+    rednet.send(id, textutils.serialize(out), PROTOCOL)
 end
 
 ------------------------------------------------------------
@@ -222,14 +216,15 @@ local function drawTabs()
             term.setTextColor(colors.white)
             term.setBackgroundColor(colors.gray)
         end
-        local pos = math.floor((width / #tabs) * (i - 0.5)) - math.ceil(#tabs[i] / 2) + 1
+        local pos = math.max(1, math.floor((width / #tabs) * (i - 0.5)) - math.ceil(#tabs[i] / 2) + 1)
         term.setCursorPos(pos, 1)
         term.write(tabs[i])
     end
     -- グループ名表示
     term.setTextColor(colors.yellow)
     term.setBackgroundColor(colors.gray)
-    term.setCursorPos(width - #group_name, 1)
+    local gx = math.max(1, width - #group_name)
+    term.setCursorPos(gx, 1)
     term.write(group_name)
 end
 
@@ -240,14 +235,17 @@ local function drawNowPlaying()
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.white)
 
-    -- 曲情報
     if now_playing then
         term.setCursorPos(2, 3)
-        term.write(now_playing.name or "unknown")
+        local name = now_playing.name or "unknown"
+        if #name > width - 3 then name = string.sub(name, 1, width - 6) .. "..." end
+        term.write(name)
         if now_playing.artist then
             term.setTextColor(colors.lightGray)
             term.setCursorPos(2, 4)
-            term.write(now_playing.artist)
+            local artist = now_playing.artist
+            if #artist > width - 3 then artist = string.sub(artist, 1, width - 6) .. "..." end
+            term.write(artist)
         end
     else
         term.setTextColor(colors.lightGray)
@@ -255,7 +253,6 @@ local function drawNowPlaying()
         term.write("No track selected")
     end
 
-    -- ステータス
     if is_loading then
         term.setTextColor(colors.yellow)
         term.setCursorPos(2, 5)
@@ -266,7 +263,6 @@ local function drawNowPlaying()
         term.write("Error")
     end
 
-    -- Play/Stop ボタン
     if playing then
         term.setTextColor(colors.white)
         term.setBackgroundColor(colors.gray)
@@ -276,22 +272,23 @@ local function drawNowPlaying()
         term.setTextColor(colors.white)
         term.setBackgroundColor(colors.gray)
         term.setCursorPos(2, 6)
-        term.write(" Play ")
+        if is_loading then
+            term.write(" Cancel ")
+        else
+            term.write(" Play ")
+        end
     end
 
-    -- Skip ボタン
     term.setTextColor(colors.white)
     term.setBackgroundColor(colors.gray)
     term.setCursorPos(10, 6)
     term.write(" Skip ")
 
-    -- Sync All ボタン
     term.setTextColor(colors.white)
     term.setBackgroundColor(colors.blue)
     term.setCursorPos(2, 8)
     term.write(" Sync All ")
 
-    -- ボリュームバー
     paintutils.drawBox(2, 10, 25, 10, colors.gray)
     local vol_w = math.floor(23 * (volume / 3) + 0.5)
     if vol_w > 0 then
@@ -302,7 +299,6 @@ local function drawNowPlaying()
     term.setCursorPos(27, 10)
     term.write(math.floor(100 * (volume / 3)) .. "%")
 
-    -- キュー
     if #queue > 0 then
         term.setTextColor(colors.lightGray)
         term.setCursorPos(2, 12)
@@ -310,7 +306,9 @@ local function drawNowPlaying()
         for i = 1, math.min(#queue, height - 13) do
             term.setTextColor(colors.white)
             term.setCursorPos(2, 12 + i)
-            term.write(i .. ". " .. (queue[i].name or "unknown"))
+            local qname = queue[i].name or "unknown"
+            if #qname > width - 5 then qname = string.sub(qname, 1, width - 8) .. "..." end
+            term.write(i .. ". " .. qname)
         end
     end
 end
@@ -342,10 +340,14 @@ local function drawPlaylist()
                 term.setTextColor(colors.white)
             end
             term.setCursorPos(2, y)
-            term.write(search_results[i].name or "unknown")
+            local rname = search_results[i].name or "unknown"
+            if #rname > width - 3 then rname = string.sub(rname, 1, width - 6) .. "..." end
+            term.write(rname)
             term.setTextColor(colors.lightGray)
             term.setCursorPos(2, y + 1)
-            term.write(search_results[i].artist or "")
+            local rartist = search_results[i].artist or ""
+            if #rartist > width - 3 then rartist = string.sub(rartist, 1, width - 6) .. "..." end
+            term.write(rartist)
         end
     elseif search_error then
         term.setBackgroundColor(colors.black)
@@ -364,26 +366,29 @@ local function drawPlaylist()
         term.write("Paste YouTube link or search keywords")
     end
 
-    -- アクションメニュー
     if result_action_mode and selected_result and search_results then
         local item = search_results[selected_result]
-        term.setBackgroundColor(colors.black)
-        term.clear()
-        drawTabs()
-        term.setCursorPos(2, 3)
-        term.setTextColor(colors.white)
-        term.write(item.name or "unknown")
-        term.setCursorPos(2, 4)
-        term.setTextColor(colors.lightGray)
-        term.write(item.artist or "")
-        term.setBackgroundColor(colors.gray)
-        term.setTextColor(colors.white)
-        term.setCursorPos(2, 6)
-        term.write(" Play Now ")
-        term.setCursorPos(2, 8)
-        term.write(" Add to Queue ")
-        term.setCursorPos(2, 10)
-        term.write(" Cancel ")
+        if item then
+            term.setBackgroundColor(colors.black)
+            term.clear()
+            drawTabs()
+            term.setCursorPos(2, 3)
+            term.setTextColor(colors.white)
+            local iname = item.name or "unknown"
+            if #iname > width - 3 then iname = string.sub(iname, 1, width - 6) .. "..." end
+            term.write(iname)
+            term.setCursorPos(2, 4)
+            term.setTextColor(colors.lightGray)
+            term.write(item.artist or "")
+            term.setBackgroundColor(colors.gray)
+            term.setTextColor(colors.white)
+            term.setCursorPos(2, 6)
+            term.write(" Play Now ")
+            term.setCursorPos(2, 8)
+            term.write(" Add to Queue ")
+            term.setCursorPos(2, 10)
+            term.write(" Cancel ")
+        end
     end
 end
 
@@ -401,12 +406,14 @@ local function drawSlaves()
     local found = false
     for id, info in pairs(slaves) do
         found = true
-        if yi > height - 4 then break end
+        if yi > height - 5 then break end
 
         term.setCursorPos(2, yi)
         if info.alive then
             term.setTextColor(colors.white)
-            term.write("ID: " .. id .. "  " .. (info.name or ""))
+            local idstr = "ID: " .. id .. "  " .. (info.name or "")
+            if #idstr > width - 3 then idstr = string.sub(idstr, 1, width - 6) .. "..." end
+            term.write(idstr)
             yi = yi + 1
             term.setCursorPos(2, yi)
             local st = info.status or "unknown"
@@ -418,7 +425,9 @@ local function drawSlaves()
             yi = yi + 1
             term.setCursorPos(2, yi)
             term.setTextColor(colors.lightGray)
-            term.write("Track:   " .. (info.track and info.track.name or "(none)"))
+            local tname = info.track and info.track.name or "(none)"
+            if #tname > width - 12 then tname = string.sub(tname, 1, width - 15) .. "..." end
+            term.write("Track:   " .. tname)
             yi = yi + 1
             term.setCursorPos(2, yi)
             term.write("Offset:  " .. string.format("%.0f", (info.offset or 0) * 1000) .. "ms")
@@ -469,6 +478,13 @@ end
 ------------------------------------------------------------
 -- 描画
 ------------------------------------------------------------
+local last_redraw = 0
+local needs_redraw = false
+
+local function scheduleRedraw()
+    needs_redraw = true
+end
+
 local function redrawScreen()
     term.setBackgroundColor(colors.black)
     term.clear()
@@ -477,6 +493,8 @@ local function redrawScreen()
     elseif current_tab == 2 then drawPlaylist()
     elseif current_tab == 3 then drawSlaves()
     elseif current_tab == 4 then drawLog() end
+    needs_redraw = false
+    last_redraw = os.clock()
 end
 
 ------------------------------------------------------------
@@ -492,8 +510,16 @@ local function syncLoop()
             if slave_count == 0 then
                 is_loading = false
                 log("No slaves connected")
-                redrawScreen()
+                scheduleRedraw()
                 goto continue
+            end
+
+            -- 既に再生中の場合は停止してから開始
+            if playing then
+                playing = false
+                broadcastCommand({cmd = "stop"})
+                markAllStopped()
+                sleep(0.5)
             end
 
             now_playing = track
@@ -501,7 +527,7 @@ local function syncLoop()
             is_loading = true
             is_error = false
             log("Starting: " .. (track.name or track.id))
-            redrawScreen()
+            scheduleRedraw()
 
             -- Phase 1: DLコマンド送信
             broadcastCommand({
@@ -534,13 +560,13 @@ local function syncLoop()
                 local total_rtt = 0
                 local valid = 0
                 for s = 1, RTT_SAMPLES do
-                    rtt_pong_received = false
+                    rtt_pong_by_id[id] = nil
                     sendTo(id, {cmd = "ping", seq = s})
                     local st = os.clock()
-                    while not rtt_pong_received and os.clock() - st < 2 do
+                    while rtt_pong_by_id[id] ~= s and os.clock() - st < 2 do
                         sleep(0.1)
                     end
-                    if rtt_pong_received then
+                    if rtt_pong_by_id[id] == s then
                         total_rtt = total_rtt + (os.clock() - st)
                         valid = valid + 1
                     end
@@ -566,7 +592,7 @@ local function syncLoop()
             markAllPlaying(track)
             playing = true
             is_loading = false
-            redrawScreen()
+            scheduleRedraw()
 
             -- Phase 4: track_end を待つ
             while playing do
@@ -584,7 +610,7 @@ local function syncLoop()
             playing = false
             markAllStopped()
             log("Track ended: " .. (track.name or ""))
-            redrawScreen()
+            scheduleRedraw()
 
             -- 次の曲があれば自動再生
             if #queue > 0 then
@@ -620,8 +646,8 @@ local function rednetLoop()
                     if not slaves[sender_id].status then
                         slaves[sender_id].status = "connected"
                     end
-                    sendTo(sender_id, {cmd = "welcome", group = group_name})
-                    redrawScreen()
+                    sendTo(sender_id, {cmd = "welcome"})
+                    scheduleRedraw()
 
                 elseif msg.type == "heartbeat" then
                     if slaves[sender_id] then
@@ -631,7 +657,7 @@ local function rednetLoop()
                         if msg.track then
                             slaves[sender_id].track = msg.track
                         end
-                        redrawScreen()
+                        scheduleRedraw()
                     end
 
                 elseif msg.type == "ready" then
@@ -639,11 +665,19 @@ local function rednetLoop()
                         slaves[sender_id].status = "ready"
                         slaves[sender_id].last_seen = os.clock()
                         log("Ready: " .. sender_id)
-                        redrawScreen()
+                        scheduleRedraw()
                     end
 
                 elseif msg.type == "pong" then
-                    rtt_pong_received = true
+                    if slaves[sender_id] then
+                        -- per-slave, per-sequence pong tracking
+                        local seq = msg.seq
+                        if seq then
+                            rtt_pong_by_id[sender_id] = seq
+                        else
+                            rtt_pong_by_id[sender_id] = 0
+                        end
+                    end
 
                 elseif msg.type == "track_end" then
                     if slaves[sender_id] then
@@ -651,7 +685,7 @@ local function rednetLoop()
                         slaves[sender_id].track = nil
                         slaves[sender_id].last_seen = os.clock()
                         log("End: " .. sender_id)
-                        redrawScreen()
+                        scheduleRedraw()
                     end
 
                 elseif msg.type == "play_started" then
@@ -660,7 +694,7 @@ local function rednetLoop()
                         slaves[sender_id].track = msg.track
                         slaves[sender_id].last_seen = os.clock()
                         log("Playing: " .. sender_id)
-                        redrawScreen()
+                        scheduleRedraw()
                     end
 
                 elseif msg.type == "play_stopped" then
@@ -669,7 +703,7 @@ local function rednetLoop()
                         slaves[sender_id].track = nil
                         slaves[sender_id].last_seen = os.clock()
                         log("Stopped: " .. sender_id)
-                        redrawScreen()
+                        scheduleRedraw()
                     end
                 end
             end
@@ -690,7 +724,7 @@ local function aliveCheckLoop()
                     info.alive = false
                     info.status = "dead"
                     log("Dead: ID " .. id)
-                    redrawScreen()
+                    scheduleRedraw()
                 end
             end
         end
@@ -698,14 +732,14 @@ local function aliveCheckLoop()
 end
 
 ------------------------------------------------------------
--- HTTP受信
+-- HTTP受信 (フィルタ済み)
 ------------------------------------------------------------
 local function httpLoop()
     while true do
-        local ev, p1, p2 = os.pullEvent()
-        if ev == "http_success" and p1 == last_search_url then
+        local ev, p1, p2 = os.pullEvent("http_success")
+        if p1 == last_search_url then
             local ok, data = pcall(function() return p2.readAll() end)
-            p2.close()
+            if p2 then p2.close() end
             if ok and data then
                 local ok2, parsed = pcall(textutils.unserialiseJSON, data)
                 if ok2 and parsed then
@@ -720,11 +754,18 @@ local function httpLoop()
                 search_error = true
                 search_waiting = false
             end
-            redrawScreen()
-        elseif ev == "http_failure" and p1 == last_search_url then
+            scheduleRedraw()
+        end
+    end
+end
+
+local function httpFailLoop()
+    while true do
+        local ev, p1 = os.pullEvent("http_failure")
+        if p1 == last_search_url then
             search_error = true
             search_waiting = false
-            redrawScreen()
+            scheduleRedraw()
         end
     end
 end
@@ -740,6 +781,18 @@ local function heartbeatLoop()
 end
 
 ------------------------------------------------------------
+-- 描画スケジューラ
+------------------------------------------------------------
+local function drawScheduler()
+    while true do
+        sleep(0.1)
+        if needs_redraw and os.clock() - last_redraw > 0.3 then
+            redrawScreen()
+        end
+    end
+end
+
+------------------------------------------------------------
 -- マウス操作
 ------------------------------------------------------------
 local function mouseLoop()
@@ -747,7 +800,6 @@ local function mouseLoop()
         local ev, btn, x, y = os.pullEvent("mouse_click")
         if btn ~= 1 then goto continue end
 
-        -- タブ切り替え
         if y == 1 then
             if x < width / 4 then current_tab = 1
             elseif x < width / 2 then current_tab = 2
@@ -755,16 +807,22 @@ local function mouseLoop()
             else current_tab = 4 end
             search_input_mode = false
             result_action_mode = false
-            redrawScreen()
+            scheduleRedraw()
 
         elseif current_tab == 1 then
-            -- Now Playing
             if y == 6 then
                 if x >= 2 and x < 8 then
                     if playing then
                         playing = false
                         broadcastCommand({cmd = "stop"})
                         log("Stopped by user")
+                    elseif is_loading then
+                        -- Loading中: キャンセル
+                        is_loading = false
+                        is_error = false
+                        sync_request = nil
+                        broadcastCommand({cmd = "stop"})
+                        log("Cancelled by user")
                     elseif now_playing then
                         sync_request = now_playing
                     elseif #queue > 0 then
@@ -772,11 +830,11 @@ local function mouseLoop()
                         table.remove(queue, 1)
                         sync_request = now_playing
                     end
-                    redrawScreen()
+                    scheduleRedraw()
                 elseif x >= 10 and x < 16 then
-                    -- Skip
                     broadcastCommand({cmd = "stop"})
                     playing = false
+                    is_loading = false
                     if #queue > 0 then
                         now_playing = queue[1]
                         table.remove(queue, 1)
@@ -787,30 +845,28 @@ local function mouseLoop()
                         playing_id = nil
                         log("Skipped (queue empty)")
                     end
-                    redrawScreen()
+                    scheduleRedraw()
                 end
             elseif y == 8 and x >= 2 and x < 12 then
-                if now_playing then
+                if now_playing and not is_loading then
                     sync_request = now_playing
                     log("Sync: " .. (now_playing.name or ""))
                 end
             elseif y == 10 and x >= 2 and x <= 25 then
                 volume = math.max(0, math.min(3, (x - 2) / 23 * 3))
                 broadcastCommand({cmd = "volume", level = volume})
-                redrawScreen()
+                scheduleRedraw()
             end
 
         elseif current_tab == 2 then
-            -- Playlist
             if not result_action_mode then
                 if y >= 3 and y <= 5 then
                     search_input_mode = true
-                    search_query = ""
                     redrawScreen()
                     term.setCursorPos(3, 4)
                     term.setBackgroundColor(colors.white)
                     term.setTextColor(colors.black)
-                    local input = read()
+                    local input = read(nil, nil, search_query)
                     search_input_mode = false
                     if #input > 0 then
                         search_query = input
@@ -820,14 +876,14 @@ local function mouseLoop()
                         search_error = false
                         search_waiting = true
                     end
-                    redrawScreen()
+                    scheduleRedraw()
                 elseif search_results then
                     for i = 1, #search_results do
                         local ry = 7 + (i - 1) * 2
                         if y == ry or y == ry + 1 then
                             selected_result = i
                             result_action_mode = true
-                            redrawScreen()
+                            scheduleRedraw()
                             break
                         end
                     end
@@ -835,36 +891,38 @@ local function mouseLoop()
             else
                 if selected_result and search_results then
                     local item = search_results[selected_result]
-                    if y == 6 then
-                        broadcastCommand({cmd = "stop"})
-                        playing = false
-                        if item.type == "playlist" and item.playlist_items then
-                            queue = {}
-                            for _, t in ipairs(item.playlist_items) do
-                                table.insert(queue, t)
+                    if item then
+                        if y == 6 then
+                            broadcastCommand({cmd = "stop"})
+                            playing = false
+                            if item.type == "playlist" and item.playlist_items then
+                                queue = {}
+                                for _, t in ipairs(item.playlist_items) do
+                                    table.insert(queue, t)
+                                end
+                                now_playing = table.remove(queue, 1)
+                            else
+                                now_playing = item
                             end
-                            now_playing = table.remove(queue, 1)
-                        else
-                            now_playing = item
-                        end
-                        result_action_mode = false
-                        log("Play: " .. (item.name or ""))
-                        sync_request = now_playing
-                    elseif y == 8 then
-                        if item.type == "playlist" and item.playlist_items then
-                            for _, t in ipairs(item.playlist_items) do
-                                table.insert(queue, t)
+                            result_action_mode = false
+                            log("Play: " .. (item.name or ""))
+                            sync_request = now_playing
+                        elseif y == 8 then
+                            if item.type == "playlist" and item.playlist_items then
+                                for _, t in ipairs(item.playlist_items) do
+                                    table.insert(queue, t)
+                                end
+                                log("Queue: " .. #item.playlist_items .. " tracks")
+                            else
+                                table.insert(queue, item)
+                                log("Queue: " .. (item.name or ""))
                             end
-                            log("Queue: " .. #item.playlist_items .. " tracks")
-                        else
-                            table.insert(queue, item)
-                            log("Queue: " .. (item.name or ""))
+                            result_action_mode = false
+                            scheduleRedraw()
+                        elseif y == 10 then
+                            result_action_mode = false
+                            scheduleRedraw()
                         end
-                        result_action_mode = false
-                        redrawScreen()
-                    elseif y == 10 then
-                        result_action_mode = false
-                        redrawScreen()
                     end
                 end
             end
@@ -874,15 +932,20 @@ local function mouseLoop()
 end
 
 ------------------------------------------------------------
--- ドラッグ (ボリューム)
+-- ドラッグ (ボリューム) - スロットル
 ------------------------------------------------------------
 local function dragLoop()
+    local last_vol_broadcast = 0
     while true do
         local ev, btn, x, y = os.pullEvent("mouse_drag")
         if btn == 1 and current_tab == 1 and y == 10 and x >= 2 and x <= 25 then
             volume = math.max(0, math.min(3, (x - 2) / 23 * 3))
-            broadcastCommand({cmd = "volume", level = volume})
-            redrawScreen()
+            local now = os.clock()
+            if now - last_vol_broadcast > 0.2 then
+                broadcastCommand({cmd = "volume", level = volume})
+                last_vol_broadcast = now
+            end
+            scheduleRedraw()
         end
     end
 end
@@ -898,9 +961,11 @@ broadcastCommand({cmd = "master_hello"})
 parallel.waitForAny(
     rednetLoop,
     httpLoop,
+    httpFailLoop,
     heartbeatLoop,
     aliveCheckLoop,
     mouseLoop,
     dragLoop,
-    syncLoop
+    syncLoop,
+    drawScheduler
 )

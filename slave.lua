@@ -44,16 +44,17 @@ do
     end)
     if ok and result then
         local f = fs.open(SELF_NAME, "w")
-        f.write(result)
-        f.close()
-        print("Updated! Restarting...")
-        sleep(1)
-        shell.run(SELF_NAME)
-        return
-    else
-        print("Using current version.")
-        sleep(0.5)
+        if f then
+            f.write(result)
+            f.close()
+            print("Updated! Restarting...")
+            sleep(1)
+            shell.run(SELF_NAME)
+            return
+        end
     end
+    print("Using current version.")
+    sleep(0.5)
 end
 
 ------------------------------------------------------------
@@ -66,6 +67,7 @@ local CACHE_DIR = "cache"
 local CONFIG_FILE = ".slave_config"
 local HEARTBEAT_INTERVAL = 5
 local DL_TIMEOUT = 30
+local MASTER_TIMEOUT = 30  -- master再接続待ち時間
 
 ------------------------------------------------------------
 -- 初期化
@@ -123,7 +125,7 @@ end
 ------------------------------------------------------------
 -- 状態
 ------------------------------------------------------------
-local state = "waiting"  -- waiting, connected, downloading, ready, playing, error
+local state = "waiting"
 local current_track = nil
 local volume = 1.0
 local playing = false
@@ -131,6 +133,7 @@ local master_id = nil
 local playback_stop = false
 local play_queue = {}
 local connected = false
+local last_master_time = 0
 
 -- ログ
 local log_lines = {}
@@ -154,15 +157,15 @@ local function drawUI()
     term.setBackgroundColor(colors.black)
     term.clear()
 
-    -- ヘッダー
     term.setTextColor(colors.white)
     term.setCursorPos(1, 1)
     term.setBackgroundColor(colors.gray)
     term.clearLine()
     term.setCursorPos(2, 1)
-    term.write("=== " .. (computer_name or "Slave") .. " ===")
+    local header = "=== " .. (computer_name or "Slave") .. " ==="
+    if #header > width then header = string.sub(header, 1, width) end
+    term.write(header)
 
-    -- ステータス
     local yi = 3
     term.setBackgroundColor(colors.black)
 
@@ -190,7 +193,9 @@ local function drawUI()
     term.write("Track:   ")
     term.setTextColor(colors.white)
     if current_track then
-        term.write(current_track.name or "unknown")
+        local tname = current_track.name or "unknown"
+        if #tname > width - 11 then tname = string.sub(tname, 1, width - 14) .. "..." end
+        term.write(tname)
     else
         term.write("(none)")
     end
@@ -261,21 +266,25 @@ local function openRednet()
 end
 
 local function sendMessage(msg)
-    msg.group = group_name
-    msg.name = computer_name
-    rednet.broadcast(textutils.serialize(msg), PROTOCOL)
+    local out = {}
+    for k, v in pairs(msg) do out[k] = v end
+    out.group = group_name
+    out.name = computer_name
+    rednet.broadcast(textutils.serialize(out), PROTOCOL)
 end
 
 local function sendToMaster(msg)
     if master_id then
-        msg.group = group_name
-        msg.name = computer_name
-        rednet.send(master_id, textutils.serialize(msg), PROTOCOL)
+        local out = {}
+        for k, v in pairs(msg) do out[k] = v end
+        out.group = group_name
+        out.name = computer_name
+        rednet.send(master_id, textutils.serialize(out), PROTOCOL)
     end
 end
 
 ------------------------------------------------------------
--- 音声DL
+-- 音声DL (rednetLoop内の呼び出し - ブロック注意)
 ------------------------------------------------------------
 local function downloadTrack(track)
     if isCached(track.id) then return true end
@@ -294,8 +303,10 @@ local function downloadTrack(track)
             local data = p2.readAll()
             p2.close()
             local wf = fs.open(cachePath(track.id), "wb")
-            wf.write(data)
-            wf.close()
+            if wf then
+                wf.write(data)
+                wf.close()
+            end
             log("OK: " .. #data .. " bytes")
             state = "ready"
             drawUI()
@@ -322,6 +333,7 @@ end
 local function playFromCache(track, start_time)
     if not isCached(track.id) then
         log("Cache miss: " .. (track.id or ""))
+        sendToMaster({type = "track_end"})
         return
     end
 
@@ -335,10 +347,10 @@ local function playFromCache(track, start_time)
     if not playing then return end
 
     log("Playing: " .. (track.name or ""))
-    state = "playing"
     current_track = track
     playback_stop = false
     playing = true
+    state = "playing"
     drawUI()
     sendToMaster({type = "play_started", track = track})
 
@@ -419,29 +431,35 @@ local function rednetLoop()
                 if cmd.cmd == "welcome" then
                     master_id = sender_id
                     connected = true
+                    last_master_time = os.clock()
                     state = "connected"
                     log("Connected to master: " .. sender_id)
                     drawUI()
 
                 elseif cmd.cmd == "download" and cmd.track then
                     master_id = sender_id
+                    last_master_time = os.clock()
                     local dl_ok = downloadTrack(cmd.track)
                     if dl_ok then
                         sendToMaster({type = "ready", track_id = cmd.track.id})
                     else
-                        sendToMaster({type = "status", state = "error"})
+                        sendToMaster({type = "track_end"})
                     end
 
                 elseif cmd.cmd == "ping" then
                     master_id = sender_id
+                    last_master_time = os.clock()
                     sendToMaster({type = "pong", seq = cmd.seq})
 
                 elseif cmd.cmd == "play_at" and cmd.track then
                     master_id = sender_id
+                    last_master_time = os.clock()
                     if cmd.volume then volume = cmd.volume end
                     table.insert(play_queue, {track = cmd.track, start_time = cmd.start_time})
 
                 elseif cmd.cmd == "stop" then
+                    master_id = sender_id
+                    last_master_time = os.clock()
                     playback_stop = true
                     playing = false
                     play_queue = {}
@@ -460,6 +478,7 @@ local function rednetLoop()
 
                 elseif cmd.cmd == "heartbeat" then
                     master_id = sender_id
+                    last_master_time = os.clock()
                     sendToMaster({type = "heartbeat", state = state, track = current_track})
                 end
             end
@@ -488,6 +507,15 @@ local function connectLoop()
     while true do
         if not connected then
             sendMessage({type = "hello"})
+        else
+            -- masterとの通信が途切れた場合は再接続
+            if os.clock() - last_master_time > MASTER_TIMEOUT then
+                connected = false
+                master_id = nil
+                state = "waiting"
+                log("Master lost, reconnecting...")
+                drawUI()
+            end
         end
         sleep(3)
     end
