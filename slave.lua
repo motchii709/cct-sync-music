@@ -442,8 +442,10 @@ end
 -- 接続ループ (未接続なら定期的にhello送信)
 ------------------------------------------------------------
 local function connectLoop()
-    while not connected do
-        sendMessage({type = "hello"})
+    while true do
+        if not connected then
+            sendMessage({type = "hello"})
+        end
         sleep(3)
     end
 end
