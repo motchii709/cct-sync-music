@@ -439,6 +439,16 @@ local function audioLoop()
 end
 
 ------------------------------------------------------------
+-- 接続ループ (未接続なら定期的にhello送信)
+------------------------------------------------------------
+local function connectLoop()
+    while not connected do
+        sendMessage({type = "hello"})
+        sleep(3)
+    end
+end
+
+------------------------------------------------------------
 -- メイン
 ------------------------------------------------------------
 openRednet()
@@ -447,4 +457,4 @@ log("Group: " .. group_name)
 log("Waiting for master...")
 sendMessage({type = "hello"})
 
-parallel.waitForAny(rednetLoop, audioLoop)
+parallel.waitForAny(rednetLoop, audioLoop, connectLoop)

@@ -116,6 +116,12 @@ local function getAliveSlaves()
     return alive
 end
 
+local function getSlaveCount()
+    local count = 0
+    for _ in pairs(slaves) do count = count + 1 end
+    return count
+end
+
 local function getAliveSlaveCount()
     local count = 0
     for _, info in pairs(slaves) do
@@ -348,7 +354,7 @@ local function drawSlaves()
     term.setTextColor(colors.white)
     term.setCursorPos(2, 3)
     local alive = getAliveSlaveCount()
-    term.write("--- Connected Slaves (" .. alive .. "/" .. #slaves .. ") ---")
+    term.write("--- Connected Slaves (" .. alive .. "/" .. getSlaveCount() .. ") ---")
 
     local yi = 5
     local found = false
