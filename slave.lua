@@ -280,10 +280,30 @@ local function downloadTrack(track)
     end)
 
     if ok and data and #data > 0 then
+        -- Check available space
+        local free = fs.getFreeSpace(CACHE_DIR)
+        if free < #data + 1024 then
+            logMsg("No space: need " .. #data .. "B, free " .. free .. "B")
+            state.status = "ERROR"
+            uiUpdate()
+            return false
+        end
         local wf = fs.open(cachePath(track_id), "wb")
         if wf then
-            wf.write(data)
+            local w_ok, w_err = pcall(wf.write, wf, data)
             wf.close()
+            if not w_ok then
+                logMsg("Write error: " .. tostring(w_err))
+                pcall(fs.delete, cachePath(track_id))
+                state.status = "ERROR"
+                uiUpdate()
+                return false
+            end
+        else
+            logMsg("Cannot open file for write")
+            state.status = "ERROR"
+            uiUpdate()
+            return false
         end
         logMsg("OK: " .. #data .. " bytes")
         state.status = "READY"
