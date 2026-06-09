@@ -198,12 +198,28 @@ local function downloadTrack(track)
             os.cancelTimer(timer)
             if data and #data > 0 then
                 local path = CACHE_DIR .. "/" .. track_id .. ".dfpwm"
+                -- Check free space
+                local free = fs.getFreeSpace(CACHE_DIR)
+                log("DL: " .. #data .. "B, free: " .. free .. "B")
+                if free < #data + 1024 then
+                    log("NO SPACE: need " .. #data .. "B, free " .. free .. "B")
+                    return false
+                end
                 local wf = fs.open(path, "wb")
                 if wf then
-                    wf.write(data)
+                    log("Writing to: " .. path)
+                    local w_ok, w_err = pcall(wf.write, wf, data)
                     wf.close()
-                    log("Downloaded: " .. track_id .. " (" .. #data .. " bytes)")
+                    if not w_ok then
+                        log("WRITE ERROR: " .. tostring(w_err))
+                        pcall(fs.delete, path)
+                        return false
+                    end
+                    log("OK: " .. #data .. " bytes written")
                     return true
+                else
+                    log("Cannot open file for write: " .. path)
+                    return false
                 end
             end
             return false
